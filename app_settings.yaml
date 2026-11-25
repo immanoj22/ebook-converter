@@ -1,0 +1,35 @@
+# Settings of the PDF to DocBook app. Every key is optional; these are the defaults.
+# Restart the app after changing this file.
+port: 8777
+bind_address: 0.0.0.0        # all network interfaces (127.0.0.1 = this computer only)
+allow_lan: true              # true lets other computers on the office network use the app
+data_folder: app_data        # one folder holds everything (jobs, uploads, profile store)
+max_parallel_jobs: 1         # conversions at the same time (1 or 2)
+converter_workers: 6         # most CPU workers a conversion gets by day (never more than cores - 2: staff keep 2 cores)
+max_upload_bytes: 2000000000 # largest PDF accepted (2 GB)
+# Folder with the layout models (the models--* folders); linked into each job's cache.
+# Leave empty if the models are already in place.
+models_folder: .cache/huggingface   # the layout models of this checkout (relative to this file)
+# Who may type new text into a book (Browse: "Add text here"): reviewers (reviewers and managers) or managers (managers only)
+add_text_by: reviewers
+
+# Automatic cleanup of regenerable files (page images, export previews, leftovers). It never
+# touches the source PDF, edits, final exports or the current book. app_data/cleanup.log and
+# app_data/cleanup_report.json show what it did or would do (python -m book_app.cleanup prints it).
+cleanup_mode: dry_run              # off | dry_run (only log what it would remove) | delete
+cleanup_interval_minutes: 15       # how often it runs
+cleanup_after_export_hours: 2      # remove previews and page images this long after the last export
+cleanup_idle_days: 7               # ... or after this many days without activity on the job
+cleanup_open_minutes: 30           # a job used in the last minutes is open: left alone
+cleanup_delete_converter_cache: false  # the converter cache (hours to rebuild) is only reported
+
+# Conversions run at low priority (nice 19), so the people using the app win. A conversion that
+# starts inside the night window uses every core (or converter_night_workers, if above 0).
+converter_night_start: "19:00"
+converter_night_end: "09:00"
+converter_night_workers: 0
+converter_nice: 19
+
+# The trained reference parser (AnyStyle, local, offline; portable Ruby in tools/anystyle_home,
+# git-ignored). Empty: the rules alone read the references.
+anystyle_command: /home/manoj-coeik/Documents/manoj/Projects/Coeik/pdf_book_converter/pdf_book_converter/tools/anystyle.sh

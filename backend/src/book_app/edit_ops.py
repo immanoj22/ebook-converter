@@ -1,0 +1,1525 @@
+"""Element changes of the Review/Browse editor, applied to the reviewer's copy of book.json.
+
+Each change takes units of the converted book and gives them another element type, moves them
+in the reading order, or takes them out of the book's content. Text is never lost: a unit's
+text record moves whole into its new element (a list item, a caption, a table cell, a note of
+a table, a furniture record), and a merge joins the records of several units with a line end.
+
+Changes (``op``):
+  list_set        {units, list_type, level?}  paragraphs become a bulleted or numbered list (a
+                                              level above 1 nests it in the list before it); the
+                                              items of one list change between bulleted/numbered
+  list_level      {unit, direction}           a list item moves one level in or out
+  box             {units, kind, title?}       a box (sidebar), a quote or a pull quote around
+                                              units; ``title``: the first unit is the box title
+  caption         {unit, figure}              the unit is a caption of that figure
+  table_make      {units, columns}            units become the cells of a table, row by row
+  table_text      {unit, table, role}         the unit is the title or a note of that table
+  footnote        {unit}                      the unit is a footnote
+  paragraph       {unit}                      a caption, footnote or credit is a body paragraph
+  chapter_authors {units}                     the units are the authors line of their chapter
+  question        {units}                     a multiple-choice question: the stem, the options
+                                              (units printed with a letter or number mark) and
+                                              the answer after them
+  bibliography    {units}                     the units are bibliography entries
+  index_entries   {units}                     the units are index entries
+  glossary        {units}                     the units are glossary entries (term, then text)
+  not_content     {units, kind}               running head, running foot, folio or printer
+                                              mark: out of the book's content (kept as furniture)
+  merge           {units}                     consecutive units of one kind become one unit
+  to_paragraph    {units, per_item?}          any text block (paragraph, heading, caption,
+                                              footnote, list, list items, box, table, figure)
+                                              becomes one body paragraph, or with ``per_item``
+                                              one paragraph per text item
+  move            {unit, direction}           the unit changes place with its neighbour
+  unwrap          {unit}                      a table, figure or box becomes its text items (cells
+                                              row by row, a figure's texts, captions and credits)
+                                              as paragraphs, in reading order
+  table_split     {unit, row}                 a table splits into two tables before its row ``row``
+                                              (counted from 1; the title stays with the first
+                                              table, the notes go with the second)
+  swap_columns    {unit}                      on its page the run starting at the unit is read
+                                              before the run above it (the second column first)
+"""
+
+from __future__ import annotations
+
+import copy
+import re
+
+from book_adapters.validate.declared import ADDED_PREFIX, REMOVED_FLAG
+
+from .overlay import (
+    EditError,
+    _chapter_level,
+    _convert,
+    _get,
+    _heading,
+    _heading_kind,
+    _prov,
+    first_mark,
+    index_units,
+    line_starts,
+    new_id,
+    slice_content,
+    walk,
+)
+
+TEXT_TYPES = ("paragraph", "heading", "caption", "footnote", "list_item")
+FURNITURE = ("running_head", "running_foot", "folio", "production_mark")
+BOX_KINDS = ("box", "quote", "pull_quote")
+LETTERED = ("lower_alpha", "upper_alpha")  # the options the export writes as a question
+NUMBER_MARK = re.compile(
+    r"^[\s ]*(?P<open>\(?)(?P<mark>\d{1,3}|[A-Za-z]|[ivxlcdm]{1,6}|[IVXLCDM]{1,6})"
+    r"(?P<punct>[.)\]:])[\s ]+"
+)
+ROMAN = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+GLOSSARY_SEPARATORS = (":", " – ", " — ", " - ", "\t")
+
+
+# ---------------------------------------------------------------------------- helpers
+
+
+def _units(ix, ids) -> tuple[list, list[dict], int, int]:
+    """(siblings, units in sibling order, first index, last index) of consecutive units: the
+    selected units share one parent and only page markers lie between them."""
+    if not ids:
+        raise EditError("Select at least one item.")
+    found = [_get(ix, i) for i in dict.fromkeys(ids)]
+    siblings = found[0][1]
+    if any(s is not siblings for _, s in found):
+        raise EditError("The selected items are not in one place in the text.")
+    pos = sorted(siblings.index(u) for u, _ in found)
+    between = siblings[pos[0] : pos[-1] + 1]
+    chosen = {id(u) for u, _ in found}
+    if any(id(u) not in chosen and u["type"] != "page_marker" for u in between):
+        raise EditError("Select items that follow each other.")
+    return siblings, [siblings[p] for p in pos], pos[0], pos[-1]
+
+
+def _markers_out(siblings, first, last) -> list[dict]:
+    """The page markers between ``first`` and ``last``; they stay in the text after the new
+    element (an element that cannot hold them)."""
+    return [u for u in siblings[first : last + 1] if u["type"] == "page_marker"]
+
+
+def _text_unit(unit: dict) -> None:
+    if not unit.get("content") or unit["type"] not in TEXT_TYPES:
+        raise EditError("Only text (a paragraph, heading, caption, footnote or list item) can "
+                        "change into this.")  # fmt: skip
+
+
+def _refs(unit: dict) -> dict:
+    return copy.deepcopy(unit.get("refs") or {"lines": [], "spans": []})
+
+
+def _base(unit: dict, type_: str, reason: str, **extra) -> dict:
+    """A unit of another type with the unit's id, pages, order, boxes, refs and text."""
+    out = _convert(unit, type_ if type_ in ("heading", "paragraph", "list") else "list_item")
+    out["type"] = type_
+    out.update(extra)
+    out["provenance"] = _prov(unit, reason)
+    out["review_status"] = "ok"
+    return out
+
+
+def _plain(unit: dict, type_: str, reason: str) -> dict:
+    """A caption, footnote or paragraph from a text unit (same text record and source)."""
+    keep = ("id", "pages", "order", "boxes", "refs", "content", "confidence", "continues_from",
+            "continues_to", "flags", "source")  # fmt: skip
+    out = {k: copy.deepcopy(unit[k]) for k in keep if k in unit}
+    out["type"] = type_
+    out["provenance"] = _prov(unit, reason)
+    out["review_status"] = "ok"
+    if type_ == "paragraph":
+        out["role"] = "body"
+    return out
+
+
+def _roman(text: str) -> int | None:
+    text = text.lower()
+    if not text or any(c not in ROMAN for c in text):
+        return None
+    total = 0
+    for a, b in zip(text, text[1:] + " ", strict=False):
+        value = ROMAN[a]
+        total += -value if b in ROMAN and ROMAN[b] > value else value
+    return total
+
+
+def number_mark(text: str) -> tuple[dict, int] | None:
+    """The printed number or letter mark at the start of a text ("1.", "(a)", "iv)") as a list
+    marker, and the offset where the item text starts."""
+    m = NUMBER_MARK.match(text)
+    if not m:
+        return None
+    mark = m["mark"]
+    if mark.isdigit():
+        kind, value = "decimal", int(mark)
+    elif len(mark) > 1 or (mark in "ivxIVX" and _roman(mark) is not None and len(mark) > 1):
+        roman = _roman(mark)
+        if roman is None:
+            return None
+        kind, value = ("lower_roman" if mark.islower() else "upper_roman"), roman
+    else:
+        kind = "lower_alpha" if mark.islower() else "upper_alpha"
+        value = ord(mark.lower()) - ord("a") + 1
+    punct = {"(": "parens"}.get(m["open"], m["punct"])
+    text_mark = text[m.start("open") : m.end("punct")]
+    return {"text": text_mark, "type": kind, "punctuation": punct, "value": value}, m.end()
+
+
+def _slice(content: dict, start: int) -> dict:
+    from .overlay import slice_content
+
+    return slice_content(content, start)
+
+
+def _item(unit: dict, type_: str, marked: str, level: int, reason: str) -> tuple[dict, dict]:
+    """A list item from a text unit, and the marker it was printed with (or None). ``marked``:
+    bullet, number or none. The printed mark becomes the item's marker; the rest is its text."""
+    text = unit["content"]["text"]
+    marker, cut = None, 0
+    if marked == "bullet" and (found := first_mark(text, {})):
+        glyph, cut = found
+        marker = {"text": glyph, "type": "bullet", "punctuation": "none", "value": None}
+    elif marked == "number" and (found := number_mark(text)):
+        marker, cut = found
+    item = _base(unit, type_, reason, item_role="item", level=level, marker=marker,
+                 children=[], locators=[], names=[], term=None)  # fmt: skip
+    if cut:
+        item["content"] = _slice(unit["content"], cut)
+    return item, marker
+
+
+def _list(first: dict, items: list[dict], list_type: str, role: str, marker_type, reason: str):
+    return {
+        "id": new_id(first["id"], "list", list_type, str(len(items))),
+        "type": "list",
+        "pages": sorted({p for u in items for p in u["pages"]}),
+        "order": first.get("order", 0),
+        "boxes": [b for u in items for b in (u.get("boxes") or [])],
+        "confidence": 1.0,
+        "continues_from": None,
+        "continues_to": None,
+        "flags": [],
+        "items": items,
+        "level": 1,
+        "list_id": new_id(first["id"], "list_id", list_type),
+        "list_role": role,
+        "list_type": list_type,
+        "marker_type": marker_type,
+        "provenance": _prov(first, reason),
+        "refs": {"lines": [], "spans": []},
+        "review_status": "ok",
+        "segment": 0,
+        "source": first.get("source") or "native",
+        "start": None,
+    }
+
+
+def _previous(siblings, index) -> dict | None:
+    j = index - 1
+    while j >= 0 and siblings[j]["type"] == "page_marker":
+        j -= 1
+    return siblings[j] if j >= 0 else None
+
+
+def _replace_run(siblings, first, last, new: list[dict]) -> None:
+    siblings[first : last + 1] = new
+
+
+# ---------------------------------------------------------------------------- lists
+
+
+def list_set(data, ix, edit):
+    list_type = edit.get("list_type")
+    if list_type not in ("bulleted", "numbered"):
+        raise EditError("A list is bulleted or numbered.")
+    level = int(edit.get("level") or 1)
+    if not 1 <= level <= 6:
+        raise EditError("A list level is from 1 to 6.")
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    if all(u["type"] == "list_item" for u in content):
+        # Items of one list: the list changes between bulleted and numbered.
+        owner = next((u for u, _ in walk(data["content"]) if u.get("items") is siblings), None)
+        if owner is None or len(content) != len(owner["items"]):
+            raise EditError("Select every item of the list to change its kind.")
+        owner["list_type"] = list_type
+        if list_type == "numbered" and owner.get("marker_type") in (None, "bullet", "dash"):
+            owner["marker_type"] = "decimal"
+        if list_type == "bulleted":
+            owner["marker_type"] = "bullet"
+        owner["provenance"] = _prov(owner, f"made a {list_type} list by the reviewer")
+        return
+    for u in content:
+        if u["type"] not in ("paragraph", "heading"):
+            raise EditError("Only paragraphs (or a whole list) can be made into a list.")
+    marked = "bullet" if list_type == "bulleted" else "number"
+    items, markers = [], []
+    for u in content:
+        item, marker = _item(u, "list_item", marked, level, f"made a list item by the reviewer")
+        items.append(item)
+        markers.append(marker)
+    kinds = {m["type"] for m in markers if m}
+    marker_type = (kinds.pop() if len(kinds) == 1 else None) if kinds else (
+        "bullet" if list_type == "bulleted" else "decimal")  # fmt: skip
+    new = _list(content[0], items, list_type, "general", marker_type, "list made by the reviewer")
+    marks = _markers_out(siblings, first, last)
+    if level == 1:
+        _replace_run(siblings, first, last, [new, *marks])
+        return
+    # A nested list belongs to the last item of the list just before it.
+    host = _previous(siblings, first)
+    if host is None or host["type"] != "list" or not host.get("items"):
+        raise EditError("A nested list needs a list just before it.")
+    parent = host["items"][-1]
+    depth, probe = 1, parent
+    while depth + 1 < level:
+        inner = next((c for c in reversed(probe.get("children") or []) if c["type"] == "list"),
+                     None)  # fmt: skip
+        if inner is None or not inner.get("items"):
+            break
+        probe, depth = inner["items"][-1], depth + 1
+    new["level"] = depth + 1
+    for item in new["items"]:
+        item["level"] = depth + 1
+    probe.setdefault("children", []).append(new)
+    probe["pages"] = sorted({*probe["pages"], *new["pages"]})
+    _replace_run(siblings, first, last, marks)
+
+
+def list_level(data, ix, edit):
+    unit, items = _get(ix, edit["unit"])
+    if unit["type"] != "list_item":
+        raise EditError("Only a list item has a level.")
+    owner = next((u for u, _ in walk(data["content"]) if u.get("items") is items), None)
+    direction = edit.get("direction")
+    i = items.index(unit)
+    if direction == "in":
+        if i == 0:
+            raise EditError("The first item of a list cannot move in: there is no item above it.")
+        above = items[i - 1]
+        nested = next((c for c in reversed(above.get("children") or []) if c["type"] == "list"),
+                      None)  # fmt: skip
+        if nested is None:
+            nested = _list(unit, [], owner["list_type"], owner.get("list_role") or "general",
+                           owner.get("marker_type"), "nested list made by the reviewer")  # fmt: skip
+            nested["level"] = (owner.get("level") or 1) + 1
+            above.setdefault("children", []).append(nested)
+        items.pop(i)
+        unit["level"] = (owner.get("level") or 1) + 1
+        nested["items"].append(unit)
+        nested["pages"] = sorted({*nested["pages"], *unit["pages"]})
+        above["pages"] = sorted({*above["pages"], *unit["pages"]})
+        if not items:
+            raise EditError("A list keeps at least one item.")
+        return
+    if direction != "out":
+        raise EditError("A list item moves in or out.")
+    # Out: the item follows the item that holds its list, one level up.
+    holder = next(
+        (
+            (u, sib)
+            for u, sib in walk(data["content"])
+            if u["type"] == "list_item" and owner in (u.get("children") or [])
+        ),
+        None,
+    )
+    if holder is None:
+        raise EditError("This item is already at the top level of its list.")
+    parent_item, outer_items = holder
+    tail = items[i + 1 :]
+    del items[i:]
+    unit["level"] = parent_item.get("level") or 1
+    if tail:  # the items after it stay under it, one level down as before
+        rest = copy.deepcopy(owner)
+        rest["id"] = new_id(owner["id"], "rest", unit["id"])
+        rest["list_id"] = owner["list_id"]
+        rest["items"] = tail
+        rest["pages"] = sorted({p for t in tail for p in t["pages"]})
+        unit.setdefault("children", []).append(rest)
+    if not items:
+        parent_item["children"] = [c for c in parent_item["children"] if c is not owner]
+    outer_items.insert(outer_items.index(parent_item) + 1, unit)
+
+
+# ---------------------------------------------------------------------------- boxes
+
+
+def box(data, ix, edit):
+    kind = edit.get("kind") or "box"
+    if kind not in BOX_KINDS:
+        raise EditError("Choose a box, a quote or a pull quote.")
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    if not content:
+        raise EditError("Select the text that goes into the box.")
+    children = copy.deepcopy(siblings[first : last + 1])
+    if edit.get("title"):
+        if kind != "box":
+            raise EditError("A quote has no title.")
+        head = next(i for i, c in enumerate(children) if c["type"] != "page_marker")
+        title = children[head]
+        if title["type"] not in ("paragraph", "heading"):
+            raise EditError("The box title must be a line of text.")
+        children[head] = _base(title, "heading", "box title set by the reviewer",
+                               level=title.get("level") or 3, role="sidebar_title",
+                               level_method="reviewer")  # fmt: skip
+        for key in ("item_role", "marker", "children", "locators", "names", "term"):
+            children[head].pop(key, None)
+        if head:  # the title comes first; the page markers before it follow it
+            children.insert(0, children.pop(head))
+    flags = [] if kind == "box" else [kind]
+    new = {
+        "id": new_id(content[0]["id"], "box", kind),
+        "type": "box",
+        "box_kind": "sidebar" if kind == "box" else "callout",
+        "pages": sorted({p for u in content for p in u["pages"]}),
+        "order": content[0].get("order", 0),
+        "boxes": [b for u in content for b in (u.get("boxes") or [])],
+        "confidence": 1.0,
+        "continues_from": None,
+        "continues_to": None,
+        "flags": flags,
+        "children": children,
+        "provenance": _prov(content[0], f"{kind.replace('_', ' ')} made by the reviewer"),
+        "refs": {"lines": [], "spans": []},
+        "review_status": "ok",
+        "source": content[0].get("source") or "native",
+    }
+    _replace_run(siblings, first, last, [new])
+
+
+# ---------------------------------------------------------------------------- figures and tables
+
+
+def _text_record(unit: dict, prefix: str) -> dict:
+    return {"id": unit["id"], "content": copy.deepcopy(unit["content"]), "refs": _refs(unit),
+            "review_status": "ok"}  # fmt: skip
+
+
+def caption(data, ix, edit):
+    unit, siblings = _get(ix, edit["unit"])
+    _text_unit(unit)
+    figure, _ = _get(ix, edit.get("figure") or "")
+    if figure["type"] != "figure":
+        raise EditError("Choose the figure the caption belongs to.")
+    if unit is figure:
+        raise EditError("A figure is not its own caption.")
+    figure.setdefault("captions", []).append(_text_record(unit, "caption"))
+    figure["provenance"] = _prov(figure, "caption linked by the reviewer")
+    siblings.remove(unit)
+
+
+def table_text(data, ix, edit):
+    unit, siblings = _get(ix, edit["unit"])
+    _text_unit(unit)
+    table, _ = _get(ix, edit.get("table") or "")
+    if table["type"] != "table":
+        raise EditError("Choose the table.")
+    role = edit.get("role")
+    record = {"id": unit["id"], "role": role, "refs": _refs(unit),
+              "content": copy.deepcopy(unit["content"]), "number": None, "numbered": False}  # fmt: skip
+    if role == "title":
+        if table.get("title"):
+            raise EditError("This table has a title already.")
+        table["title"] = record
+    elif role == "note":
+        table.setdefault("notes", []).append(record)
+    else:
+        raise EditError("A table text is its title or a note.")
+    table["provenance"] = _prov(table, f"table {role} set by the reviewer")
+    siblings.remove(unit)
+
+
+def table_make(data, ix, edit):
+    columns = int(edit.get("columns") or 1)
+    if not 1 <= columns <= 20:
+        raise EditError("A table has 1 to 20 columns.")
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    for u in content:
+        _text_unit(u)
+    if len(content) < columns:
+        raise EditError("Select at least one item for each column.")
+    cells = []
+    for n, u in enumerate(content):
+        row, col = divmod(n, columns)
+        box_ = (u.get("boxes") or [None])[0] or {"page": u["pages"][0], "x0": 0, "y0": 0,
+                                                    "x1": 0, "y1": 0}  # fmt: skip
+        cells.append({
+            "id": u["id"], "row": row, "column": col, "box": box_, "column_span": 1,
+            "row_span": 1, "role": "data", "headers": [],
+            "content": [{"type": "text", "content": copy.deepcopy(u["content"]),
+                         "refs": _refs(u)}],
+        })  # fmt: skip
+    rows = (len(content) + columns - 1) // columns
+    head = content[0]
+    new = {
+        "id": new_id(head["id"], "table", str(columns)),
+        "type": "table",
+        "pages": sorted({p for u in content for p in u["pages"]}),
+        "order": head.get("order", 0),
+        "boxes": [b for u in content for b in (u.get("boxes") or [])],
+        "cells": cells,
+        "columns": columns,
+        "rows": rows,
+        "header_rows": 0,
+        "notes": [],
+        "title": None,
+        "flags": [],
+        "provenance": _prov(head, "table made by the reviewer"),
+        "refs": {"lines": [], "spans": []},
+        "review_status": "ok",
+        "source": head.get("source") or "native",
+    }
+    _replace_run(siblings, first, last, [new, *_markers_out(siblings, first, last)])
+
+
+# ---------------------------------------------------------------------------- text roles
+
+
+def footnote(data, ix, edit):
+    unit, siblings = _get(ix, edit["unit"])
+    _text_unit(unit)
+    if unit["type"] == "list_item":
+        raise EditError("A list item cannot be a footnote; take it out of the list first.")
+    siblings[siblings.index(unit)] = _plain(unit, "footnote", "made a footnote by the reviewer")
+
+
+def paragraph(data, ix, edit):
+    unit, siblings = _get(ix, edit["unit"])
+    if unit["type"] not in ("caption", "footnote", "paragraph"):
+        raise EditError("Only a caption, a footnote or a paragraph of another kind can be made a "
+                        "body paragraph here.")  # fmt: skip
+    new = _plain(unit, "paragraph", "made a body paragraph by the reviewer")
+    new["flags"] = [f for f in new.get("flags") or [] if f != "chapter_authors"]
+    siblings[siblings.index(unit)] = new
+
+
+def chapter_authors(data, ix, edit):
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    for u in units:
+        if u["type"] == "page_marker":
+            continue
+        if u["type"] != "paragraph":
+            raise EditError("Only paragraphs can be the authors line.")
+        u["role"] = "credit"
+        u["flags"] = [*(f for f in u.get("flags") or [] if f != "chapter_authors"),
+                      "chapter_authors"]  # fmt: skip
+        u["provenance"] = _prov(u, "chapter authors set by the reviewer")
+        u["review_status"] = "ok"
+
+
+def _entries(data, ix, edit, item_type, list_type, role, reason, term=False):
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    items = []
+    for u in content:
+        _text_unit(u)
+        if u["type"] == "list_item":
+            raise EditError("Select paragraphs (a list item is already an entry of a list).")
+        item = _base(u, item_type, reason, item_role=None, level=1, marker=None, children=[],
+                     locators=[], names=[], term=None)  # fmt: skip
+        if term:
+            text = u["content"]["text"]
+            cut = min((text.find(s) for s in GLOSSARY_SEPARATORS if text.find(s) > 0),
+                      default=-1)  # fmt: skip
+            if cut < 0:
+                cut = text.find("\n")
+            if cut <= 0:
+                raise EditError("Each glossary entry needs its term first, then ':' or a dash "
+                                "or a new line, then the text: " + repr(text[:40]))  # fmt: skip
+            item["term"] = [0, cut]
+        items.append(item)
+    marks = _markers_out(siblings, first, last)
+    before = _previous(siblings, first)
+    if before is not None and before["type"] == "list" and before.get("list_type") == list_type:
+        before["items"] += items  # the entries continue the list just before them
+        before["pages"] = sorted({*before["pages"], *(p for i in items for p in i["pages"])})
+        _replace_run(siblings, first, last, marks)
+        return
+    new = _list(content[0], items, list_type, role, None, reason)
+    _replace_run(siblings, first, last, [new, *marks])
+
+
+def bibliography(data, ix, edit):
+    _entries(data, ix, edit, "bibliography_entry", "bibliography", "bibliography",
+             "bibliography entry set by the reviewer")  # fmt: skip
+
+
+def index_entries(data, ix, edit):
+    _entries(data, ix, edit, "index_entry", "index", "index", "index entry set by the reviewer")
+
+
+def glossary(data, ix, edit):
+    _entries(data, ix, edit, "glossary_entry", "glossary", "glossary",
+             "glossary entry set by the reviewer", term=True)  # fmt: skip
+
+
+def question(data, ix, edit):
+    """Stem units until the first unit printed with a letter or number mark, the marked units
+    as the options (a lettered list), the units after the options as the answer."""
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    lists = [k for k, u in enumerate(content) if u["type"] == "list"]
+    for k, u in enumerate(content):
+        if k not in lists:
+            _text_unit(u)
+        if u["type"] == "list_item":
+            raise EditError("Select paragraphs and lists; a single list item is not a question.")
+    if lists:
+        # The options were read as a list already: the stem before it, the answer after it.
+        stem_end = lists[0]
+        if len(lists) > 1 or stem_end == 0:
+            raise EditError("Select the question's text, then its one list of options.")
+        options_list = copy.deepcopy(content[stem_end])
+        if len(options_list["items"]) < 2:
+            raise EditError("A multiple-choice question has at least two options.")
+        stem, answer = content[:stem_end], content[stem_end + 1 :]
+        opts = options_list
+        if opts.get("marker_type") not in LETTERED:
+            raise EditError("The options must be lettered, like (a) or B.")
+        opts["list_type"], opts["list_role"] = "numbered", "options"
+        opts["provenance"] = _prov(opts, "options set by the reviewer")
+    else:
+        stem_end = next((i for i, u in enumerate(content)
+                         if i and number_mark(u["content"]["text"])), None)  # fmt: skip
+        if stem_end is None:
+            raise EditError("The options must start with a letter or a number, like (a) or B.")
+        end = stem_end
+        while end < len(content) and number_mark(content[end]["content"]["text"]):
+            end += 1
+        stem, options, answer = content[:stem_end], content[stem_end:end], content[end:]
+        if len(options) < 2:
+            raise EditError("A multiple-choice question has at least two options.")
+        items = []
+        for u in options:
+            item, _ = _item(u, "list_item", "number", 1, "option set by the reviewer")
+            items.append(item)
+        kinds = {i["marker"]["type"] if i.get("marker") else None for i in items}
+        if len(kinds) != 1 or not kinds <= set(LETTERED):
+            raise EditError("The options must be lettered, like (a) or B.")
+        marker_type = kinds.pop()
+        opts = _list(options[0], items, "numbered", "options", marker_type,
+                     "options set by the reviewer")  # fmt: skip
+    head = stem[0]
+    number = number_mark(head["content"]["text"])
+    pages = sorted({p for u in content for p in u["pages"]})
+
+    def part(kind, children, key=None):
+        return {
+            "id": new_id(head["id"], "question", kind),
+            "type": kind, "pages": sorted({p for c in children for p in c["pages"]}) or pages,
+            "order": (children[0] if children else head).get("order", 0), "boxes": [],
+            "confidence": 1.0, "continues_from": None, "continues_to": None, "flags": [],
+            "children": children, "key": key, "provenance": _prov(head, f"question {kind} set by the reviewer"),
+            "refs": {"lines": [], "spans": []}, "review_status": "ok", "source": head.get("source") or "native",
+        }  # fmt: skip
+
+    parts = [part("question", [*copy.deepcopy(stem), opts])]
+    if answer:
+        key = None
+        found = re.search(r"\(([A-Za-z])\)|\b([A-Za-z])\b\s*$", answer[0]["content"]["text"][:60])
+        if found:
+            key = (found[1] or found[2]).lower()
+        parts.append(part("answer", copy.deepcopy(answer), key))
+    entry = {
+        "id": new_id(head["id"], "question_entry"), "type": "question_entry", "pages": pages,
+        "order": head.get("order", 0), "boxes": [], "confidence": 1.0, "continues_from": None,
+        "continues_to": None, "flags": [], "children": parts,
+        "number": number[0]["value"] if number and number[0]["type"] == "decimal" else None,
+        "provenance": _prov(head, "question set by the reviewer"), "refs": {"lines": [], "spans": []},
+        "review_status": "ok", "source": head.get("source") or "native",
+    }  # fmt: skip
+    marks = _markers_out(siblings, first, last)
+    before = _previous(siblings, first)
+    if before is not None and before["type"] == "question_set":
+        before["children"].append(entry)
+        before["pages"] = sorted({*before["pages"], *pages})
+        _replace_run(siblings, first, last, marks)
+        return
+    qset = {**{k: v for k, v in entry.items() if k not in ("number",)},
+            "id": new_id(head["id"], "question_set"), "type": "question_set",
+            "children": [entry]}  # fmt: skip
+    _replace_run(siblings, first, last, [qset, *marks])
+
+
+# ---------------------------------------------------------------------------- out of the book
+
+
+def not_content(data, ix, edit):
+    kind = edit.get("kind")
+    if kind not in FURNITURE:
+        raise EditError("Say what it is: running head, running foot, page number or printer mark.")
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    for u in content:
+        if not u.get("content"):
+            raise EditError("Only text can be taken out of the book here.")
+    furniture = data.get("furniture")
+    if furniture is None:
+        furniture = data["furniture"] = []
+    for u in content:
+        furniture.append({
+            "id": u["id"], "kind": kind, "page": u["pages"][0], "refs": _refs(u),
+            "content": copy.deepcopy(u["content"]), "boxes": copy.deepcopy(u.get("boxes") or []),
+            "confidence": 1.0, "flags": ["set by the reviewer"], "review_status": "ok",
+        })  # fmt: skip
+        siblings.remove(u)
+
+
+# ---------------------------------------------------------------------------- restore a line
+
+
+RESTORABLE = ("running_head", "running_foot")  # page numbers and printer marks are never book text
+RESTORE_AS = ("chapter", "part", "heading", "paragraph")
+TOLERANCE = 2.0  # points: a line that only touches another one's edge is not above or below it
+
+
+def _box_on(item: dict, page: int) -> dict | None:
+    return next((b for b in item.get("boxes") or [] if b.get("page", page) == page), None)
+
+
+def _across(a: dict, b: dict) -> bool:
+    """The two boxes share part of their width (the same column, or one spans the other)."""
+    return min(a["x1"], b["x1"]) - max(a["x0"], b["x0"]) > TOLERANCE
+
+
+def restore_place(data: dict, item: dict) -> tuple[list, int] | None:
+    """(siblings, index) where a page line goes back into the text, from where it stands on
+    the page: after the last block above it in its column, else before the first block below
+    it, else before the first block under it at all. The text order of the blocks is kept
+    (no sort by position): only the neighbours are found by position."""
+    page = item["page"]
+    box = _box_on(item, page)
+    here = []  # (unit, siblings, box) in text order
+    for unit, siblings in walk(data["content"]):
+        if unit["type"] == "page_marker" or page not in (unit.get("pages") or []):
+            continue
+        b = _box_on(unit, page)
+        if b:
+            here.append((unit, siblings, b))
+    if box and here:
+        mid = (box["y0"] + box["y1"]) / 2  # a block is above or below by where it stands against the line's middle
+        above = [h for h in here if h[2]["y1"] <= mid + TOLERANCE and _across(h[2], box)]
+        if above:
+            unit, siblings, _ = above[-1]
+            return siblings, siblings.index(unit) + 1
+        below = [h for h in here if h[2]["y0"] >= mid - TOLERANCE and _across(h[2], box)]
+        if not below:
+            below = [h for h in here if h[2]["y0"] >= mid - TOLERANCE]
+        if below:
+            unit, siblings, _ = below[0]
+            return siblings, siblings.index(unit)
+    if here:
+        unit, siblings, _ = here[-1]
+        return siblings, siblings.index(unit) + 1
+    for unit, siblings in walk(data["content"]):  # a page with no block: after its page marker
+        if unit["type"] == "page_marker" and unit.get("page") == page:
+            return siblings, siblings.index(unit) + 1
+    return None
+
+
+def restore_line(data, ix, edit):
+    """Put a line of the PDF text that the book keeps as page furniture (a running head the
+    converter read where a title stands) back into the text as a chapter title, a part title,
+    a heading or a paragraph, at its place on the page. The text, its source lines and its
+    position are the line's own: nothing is typed, and the line leaves the furniture, so the
+    lossless count stays whole (the tokens move from furniture to content)."""
+    furniture = data.get("furniture") or []
+    item = next((f for f in furniture if f.get("id") == edit.get("line")), None)
+    if item is None:
+        raise EditError("This line is no longer in the page furniture (an earlier change used it).")
+    if item.get("kind") not in RESTORABLE:
+        raise EditError("Only a running head or foot can go back into the text; page numbers and "
+                        "printer's marks are not book text.")  # fmt: skip
+    as_ = edit.get("as")
+    if as_ not in RESTORE_AS:
+        raise EditError("Say what it is: a chapter title, a part title, a heading or a paragraph.")
+    if item["id"] in ix:
+        raise EditError("This line is already in the text.")
+    if not (item.get("content") or {}).get("text", "").strip():
+        raise EditError("This line has no text.")
+    place = restore_place(data, item)
+    if place is None:
+        raise EditError("There is no place for this line on its page.")
+    siblings, at = place
+    neighbour = siblings[at] if at < len(siblings) else siblings[at - 1]
+    unit = {
+        "id": item["id"], "type": "paragraph", "role": "body", "pages": [item["page"]],
+        "order": neighbour.get("order", 0), "boxes": copy.deepcopy(item.get("boxes") or []),
+        "refs": copy.deepcopy(item.get("refs") or {"lines": [], "spans": []}),
+        "content": copy.deepcopy(item["content"]), "confidence": item.get("confidence", 1.0),
+        "continues_from": None, "continues_to": None, "flags": [], "source": "native",
+        "provenance": {"stages": ["review"],
+                       "reasons": [f"restored from the page {item['kind'].replace('_', ' ')} by "
+                                   "the reviewer"]},  # fmt: skip
+        "review_status": "ok",
+    }  # fmt: skip
+    siblings.insert(at, unit)
+    furniture.remove(item)
+    ix = index_units(data)
+    if as_ == "chapter":
+        _heading_kind(data, ix, {"unit": unit["id"], "kind": "chapter"})
+    elif as_ == "part":
+        _heading_kind(data, ix, {"unit": unit["id"], "kind": "part"})
+    elif as_ == "heading":
+        level = int(edit.get("level") or _chapter_level(data) + 1)
+        if not 1 <= level <= 9:
+            raise EditError("A heading level is from 1 to 9.")
+        _heading(data, ix, {"unit": unit["id"], "level": level})
+
+
+# ---------------------------------------------------------------------------- remove and add blocks
+
+REMOVED = REMOVED_FLAG  # first flag of a furniture record made by "Remove from book"
+ADDED = ADDED_PREFIX  # provenance reason of a block the reviewer typed ("added by <name>")
+REMOVE_TYPES_NOT = ("figure", "equation", "page_marker")
+THEN_OPS = ("list_set", "list_level", "box", "caption", "table_make", "table_text", "footnote",
+            "paragraph", "chapter_authors", "question", "bibliography", "index_entries",
+            "glossary")  # fmt: skip
+TEXT_CONTENT_KEYS = ("text", "spans", "joins", "source_runs", "raw", "language", "script",
+                     "direction")  # fmt: skip
+
+
+def removed_info(item: dict) -> dict | None:
+    """Who removed a furniture record and by which change, or None when it is not a removed block."""
+    flags = item.get("flags") or []
+    if REMOVED not in flags:
+        return None
+    pick = lambda p: next((f[len(p):] for f in flags if f.startswith(p)), None)  # noqa: E731
+    return {"who": pick("by:"), "event": pick("event:"), "block": pick("block:"), "unit": pick("was:")}
+
+
+def added_by(unit: dict) -> str | None:
+    for reason in (unit.get("provenance") or {}).get("reasons") or []:
+        if reason.startswith(ADDED):
+            return reason[len(ADDED):]
+    return None
+
+
+def lines_not_in_book(data: dict, page: int) -> list[dict]:
+    """PDF lines of a page that the book keeps out of its text and could take back: a running
+    head the page before does not carry too (a title read as a running head) and every block
+    a reviewer removed. They are offered (Restore) before any text is typed."""
+    furniture = data.get("furniture") or []
+    norm = lambda f: " ".join(((f.get("content") or {}).get("text") or "").split())  # noqa: E731
+    before = {norm(f) for f in furniture if f["page"] == page - 1 and f["kind"] == "running_head"}
+    out = []
+    for f in furniture:
+        if f["page"] != page or not norm(f):
+            continue
+        if removed_info(f):
+            out.append(f)
+        elif f["kind"] == "running_head" and norm(f) not in before:
+            out.append(f)
+    return out
+
+
+def _ancestors(units, target: str, chain=()):
+    """[(container, its siblings list), ...] from the outermost container to the parent of the
+    unit ``target``; None when the unit is not in ``units``."""
+    for u in units:
+        if u.get("id") == target:
+            return list(chain)
+        for key in ("items", "children"):
+            if u.get(key):
+                found = _ancestors(u[key], target, (*chain, (u, units)))
+                if found is not None:
+                    return found
+    return None
+
+
+def _own_records(unit: dict) -> list[dict]:
+    from book_core.assembly.lossless import _records
+
+    return list(_records(unit))
+
+
+def _text_content(record: dict) -> dict:
+    out = {k: copy.deepcopy(record[k]) for k in TEXT_CONTENT_KEYS if k in record}
+    out.setdefault("text", "")
+    return out
+
+
+def remove_block(data, ix, edit):
+    """Take blocks out of the book text. Their text goes to the page's "left out on purpose"
+    list (page furniture of kind printer's mark, flagged as removed with who and by which
+    change), so no text is lost; undoing the change brings the blocks back whole. The lossless
+    check counts it as an intentional removal and the QC report lists every removed block."""
+    ids = list(dict.fromkeys(edit.get("units") or []))
+    if not ids:
+        raise EditError("Select at least one block.")
+    who = (edit.get("who") or "").strip() or "the reviewer"
+    furniture = data.get("furniture")
+    if furniture is None:
+        furniture = data["furniture"] = []
+    gone: set[str] = set()
+    for uid in ids:
+        unit, siblings = _get(ix, uid)
+        if unit["type"] in REMOVE_TYPES_NOT:
+            raise EditError("Only text can be removed from the book here (not a picture or a page mark).")
+        records = _own_records(unit)
+        if not any((r.get("text") or "").strip() for r in records):
+            raise EditError("This block has no text to leave out.")
+        page = (unit.get("pages") or [1])[0]
+        for k, record in enumerate(records):
+            fid = unit["id"] if len(records) == 1 else new_id(unit["id"], "removed", str(k))
+            furniture.append({
+                "id": fid, "kind": "production_mark", "page": page, "refs": _refs(unit),
+                "content": _text_content(record), "boxes": copy.deepcopy(unit.get("boxes") or []),
+                "confidence": 1.0, "review_status": "ok",
+                "flags": [REMOVED, f"by:{who}", f"event:{edit.get('id') or ''}",
+                          f"block:{unit['type']}", f"was:{unit['id']}"],
+            })  # fmt: skip
+        chain = _ancestors(data["content"], unit["id"]) or []
+        siblings.remove(unit)
+        gone |= {u["id"] for u, _ in walk([unit]) if u.get("id")}
+        for container, holder in reversed(chain):  # a list or box left empty goes too
+            if any(container.get(k) for k in ("items", "children")) or _own_records(container):
+                break
+            holder.remove(container)
+            gone.add(container["id"])
+    for u, _ in walk(data["content"]):  # no join or link points at a removed block
+        for key in ("continues_from", "continues_to"):
+            if (u.get(key) or {}).get("unit") in gone:
+                u[key] = None
+    outline = (data.get("navigation") or {}).get("outline")
+    if outline:
+        data["navigation"]["outline"] = [e for e in outline if e.get("heading") not in gone]
+
+
+def _fill_new(value, new_id_):
+    if value == "$new":
+        return new_id_
+    if isinstance(value, list):
+        return [_fill_new(v, new_id_) for v in value]
+    if isinstance(value, dict):
+        return {k: _fill_new(v, new_id_) for k, v in value.items()}
+    return value
+
+
+def add_block(data, ix, edit):
+    """Insert a block of typed text before or after another block. It is a paragraph, a heading
+    (``level``), a list item (next to an item of a list) or, with ``then`` (any change of the
+    Change element menu with "$new" for the new block, e.g. a caption, quote or table), any
+    other element. The block carries "added by <name>" in its provenance, which every later
+    change keeps, so it can be changed like any other block. The PDF has no such text: the
+    export lists it as words added by hand, never as lost or extra."""
+    anchor, where = edit.get("anchor"), edit.get("where")
+    if where not in ("before", "after"):
+        raise EditError("Say whether the text goes before or after the block.")
+    text = " ".join(str(edit.get("text") or "").split())
+    if not text:
+        raise EditError("Type the text first.")
+    if len(text) > 20000:
+        raise EditError("That is too long for one block (20,000 characters).")
+    as_ = edit.get("as") or "paragraph"
+    if as_ not in ("paragraph", "heading", "list_item"):
+        raise EditError("Say what the new block is.")
+    who = (edit.get("who") or "").strip() or "the reviewer"
+    unit, siblings = _get(ix, anchor)
+    page = int(edit.get("page") or (unit.get("pages") or [1])[0])
+    if page not in (unit.get("pages") or [page]):
+        page = unit["pages"][0]
+    missing = lines_not_in_book(data, page)
+    if missing:
+        raise EditError(
+            f"Page {page} has {len(missing)} line{'s' if len(missing) != 1 else ''} from the PDF "
+            "that are not in the book. Restore them first; text is typed only where the PDF "
+            "has none.")  # fmt: skip
+    chain = _ancestors(data["content"], anchor) or []
+    uid = new_id("added", anchor, where, text, str(edit.get("id") or ""))
+    reason = ADDED + who
+    neighbour = unit
+    base = {
+        "id": uid, "type": "paragraph", "role": "body", "pages": [page],
+        "order": neighbour.get("order", 0), "boxes": [],
+        "refs": {"lines": [], "spans": []},
+        "content": {"text": text, "spans": [], "joins": [], "source_runs": [], "raw": None},
+        "confidence": 1.0, "continues_from": None, "continues_to": None, "flags": [],
+        "source": "native", "provenance": {"stages": ["review"], "reasons": [reason]},
+        "review_status": "ok",
+    }  # fmt: skip
+    if as_ == "list_item":
+        if unit["type"] == "list":
+            level = 1
+            target = unit["items"]
+            at = 0 if where == "before" else len(target)
+        elif unit["type"] == "list_item":
+            level, target = unit.get("level") or 1, siblings
+            at = target.index(unit) + (0 if where == "before" else 1)
+        else:
+            raise EditError("A list item goes next to an item of a list.")
+        item, _ = _item(base, "list_item", "none", level, reason)
+        item["provenance"] = {"stages": ["review"], "reasons": [reason]}
+        target.insert(at, item)
+    else:
+        target, anchor_unit = siblings, unit
+        while chain and chain[-1][0]["type"] != "box":  # inside a list or question: beside it
+            anchor_unit, target = chain.pop()
+        at = target.index(anchor_unit) + (0 if where == "before" else 1)
+        target.insert(at, base)
+    ix2 = index_units(data)
+    if as_ == "heading":
+        level = int(edit.get("level") or _chapter_level(data) + 1)
+        if not 1 <= level <= 9:
+            raise EditError("A heading level is from 1 to 9.")
+        _heading(data, ix2, {"unit": uid, "level": level})
+    then = edit.get("then")
+    if then:
+        then = _fill_new(then, uid)
+        if then.get("op") not in THEN_OPS:
+            raise EditError("A new block cannot become that.")
+        OPS[then["op"]](data, index_units(data), then)
+    _keep_added_mark(data, uid, text, reason)
+
+
+def _keep_added_mark(data: dict, uid: str, text: str, reason: str) -> None:
+    """After a change of element the new text may sit in a cell or note whose holder lost the
+    mark: put it on the smallest block that holds the typed text."""
+    holders = [u for u, _ in walk(data["content"])]
+    if any(added_by(u) and any(r.get("text") == text for r in _own_records(u)) for u in holders):
+        return
+    for u in reversed(holders):
+        if any(r.get("text") == text for r in _own_records(u)):
+            p = u.setdefault("provenance", {"stages": ["review"]})
+            p["reasons"] = [*p.get("reasons", []), reason]
+            return
+    raise EditError("The new text was lost by that change.")
+
+
+# ---------------------------------------------------------------------------- remove a space
+
+
+def _merge_spans(spans: list[dict]) -> list[dict]:
+    """Neighbouring spans that differ only in where they start and end become one again."""
+    out: list[dict] = []
+    for span in spans:
+        last = out[-1] if out else None
+        if last and last["end"] == span["start"] and {**last, "end": 0} == {**span, "start": last["start"], "end": 0}:
+            last["end"] = span["end"]
+        else:
+            out.append(dict(span))
+    return out
+
+
+def remove_char(data, ix, edit):
+    """Take out the one space that follows a hyphen between two letters ("acid- base" becomes
+    "acid-base"): the review item "Hyphen followed by a space". Spans and line-end join records
+    after it move one place back; nothing else in the text changes."""
+    unit, _ = _get(ix, edit["unit"])
+    content = unit.get("content")
+    if not content or unit["type"] not in TEXT_TYPES:
+        raise EditError("This item has no text.")
+    text, at = content["text"], int(edit["offset"])
+    if not (0 < at < len(text) - 1 and text[at] == " " and text[at - 1] == "-"
+            and text[at - 2 : at - 1].isalpha() and text[at + 1].isalpha()):  # fmt: skip
+        raise EditError("That space is no longer after a hyphen between two letters.")
+    if content.get("source_runs"):
+        raise EditError("This text is made from split source lines; the space cannot be removed here.")
+    left, right = slice_content(content, 0, at), slice_content(content, at + 1)
+    n = len(left["text"])
+    merged = copy.deepcopy(content)
+    merged["text"] = left["text"] + right["text"]
+    merged["spans"] = _merge_spans(
+        left["spans"] + [{**s, "start": s["start"] + n, "end": s["end"] + n} for s in right["spans"]]
+    )
+    merged["joins"] = left["joins"] + [
+        {**j, "at": j["at"] + n, "hyphen_at": None if j.get("hyphen_at") is None else j["hyphen_at"] + n}
+        for j in right["joins"]
+    ]
+    merged["raw"], merged["source_runs"] = None, []
+    unit["content"] = merged
+
+
+def edit_text(data, ix, edit):
+    """Correct the text of one block where the PDF's own text is wrong or lacks a character (a
+    reference: the full stop between its title and its journal). The typed text replaces the
+    block's text; its spans and line-end records pointed into the old text, so they are dropped.
+    The block's provenance says who corrected it."""
+    unit, _ = _get(ix, edit["unit"])
+    content = unit.get("content")
+    if not content or unit["type"] not in (*TEXT_TYPES, "bibliography_entry"):
+        raise EditError("This item has no text to correct.")
+    lines = [" ".join(line.split()) for line in str(edit.get("text") or "").split("\n")]
+    text = "\n".join(line for line in lines if line)
+    if not text:
+        raise EditError("Type the text first.")
+    if len(text) > 20000:
+        raise EditError("That is too long for one block (20,000 characters).")
+    who = (edit.get("who") or "").strip() or "the reviewer"
+    corrected = copy.deepcopy(content)
+    corrected["text"], corrected["spans"], corrected["joins"] = text, [], []
+    corrected["raw"], corrected["source_runs"] = None, []
+    unit["content"] = corrected
+    provenance = unit.setdefault("provenance", {"stages": ["review"]})
+    provenance["reasons"] = [*provenance.get("reasons", []), f"text corrected by {who}"]
+
+
+# ---------------------------------------------------------------------------- merge and order
+
+
+# Words that may follow a suspended hyphen ("Meta- und Objektebene"): the hyphen is real.
+SUSPENDED = frozenset({"und", "oder", "bzw", "sowie", "and", "or", "y", "o", "e", "et", "ou", "ni", "u"})
+
+
+def _word_after(text: str, at: int) -> str:
+    m = re.match(r"[^\W\d_]+", text[at:])
+    return m.group().lower() if m else ""
+
+
+def _break_decision(before: str, after: str, spaced: bool) -> tuple[str, int | None] | None:
+    """What a line end between ``before`` and ``after`` is: ("join", hyphen offset) a break
+    hyphen to drop, ("keep", None) a real hyphen at the line end, ("word", None) a word cut
+    without a hyphen, or None (a space between words). A cut word is only assumed when the letters touch the line
+    end on both sides and the next line goes on in lower case; without ``spaced`` (the text
+    never writes a space before a line end) a hyphen is the only sign of a cut."""
+    if not after or not after[0].isalpha():
+        return None
+    if before.endswith("-") and len(before) > 1 and before[-2].isalpha():
+        if _word_after(after, 0) in SUSPENDED:
+            return None  # "Meta- und": the hyphen stays and the line end reads as a space
+        if after[0].isupper():
+            return ("keep", None)  # "Nord-" "Süd": a real compound, the line end vanishes
+        return ("join", len(before) - 1)
+    if spaced and before and before[-1].isalpha() and after[0].islower():
+        return ("word", None)
+    return None
+
+
+def _join_content(contents: list[dict], spaced: bool = True) -> dict:
+    """One text record from several, joined by a line end: spans shifted, joins kept. A line
+    end between two records that cuts a word is recorded as a join (the break hyphen or the
+    line end vanishes when read); the characters stay in the text."""
+    out = copy.deepcopy(contents[0])
+    text, spans, joins = out["text"], list(out.get("spans") or []), list(out.get("joins") or [])
+    for c in contents[1:]:
+        shift = len(text) + 1
+        decision = _break_decision(text, c["text"], spaced)
+        if decision:
+            kind, hyphen = decision
+            joins.append({"at": len(text), "decision": kind, "hyphen_at": hyphen,
+                          "confidence": 0.9, "review_status": "ok"})  # fmt: skip
+        text = text + "\n" + c["text"]
+        spans += [{**s, "start": s["start"] + shift, "end": s["end"] + shift}
+                  for s in c.get("spans") or ()]  # fmt: skip
+        joins += [{**j, "at": j["at"] + shift,
+                   "hyphen_at": j["hyphen_at"] + shift if j.get("hyphen_at") is not None else None}
+                  for j in c.get("joins") or ()]  # fmt: skip
+    out.update(text=text, spans=spans, joins=joins, raw=None, source_runs=[])
+    return out
+
+
+def _spaced(contents: list[dict]) -> bool:
+    """Does this text write a space before a line end (so a line end without one cuts a word)?"""
+    return any(re.search(r"\s\n", c["text"]) or (i < len(contents) - 1 and c["text"][-1:].isspace())
+               for i, c in enumerate(contents))  # fmt: skip
+
+
+def _resolve_breaks(content: dict, spaced: bool) -> dict:
+    """The line ends inside one record that have no join record yet and cut a word get one."""
+    text = content["text"]
+    known = {j["at"] for j in content.get("joins") or ()}
+    new = []
+    for m in re.finditer("\n", text):
+        if m.start() in known or m.start() == 0:
+            continue
+        if decision := _break_decision(text[: m.start()], text[m.end() :], spaced):
+            kind, hyphen = decision
+            new.append({"at": m.start(), "decision": kind, "hyphen_at": hyphen,
+                        "confidence": 0.9, "review_status": "ok"})  # fmt: skip
+    if not new:
+        return content
+    out = copy.deepcopy(content)
+    out["joins"] = sorted([*(out.get("joins") or []), *new], key=lambda j: j["at"])
+    out["raw"], out["source_runs"] = None, []
+    return out
+
+
+def _merge_units(ix, content: list[dict]) -> None:
+    """The units (all of one text kind) become the first one: text joined (a cut word is one
+    word again), lines, boxes, pages and continuation of all kept."""
+    head = content[0]
+    head["content"] = _join_content([u["content"] for u in content], _spaced([u["content"] for u in content]))
+    refs = _refs(head)
+    for u in content[1:]:
+        r = u.get("refs") or {}
+        refs["lines"] += [x for x in r.get("lines") or [] if x not in refs["lines"]]
+        refs["spans"] += r.get("spans") or []
+    head["refs"] = refs
+    head["boxes"] = [b for u in content for b in (u.get("boxes") or [])]
+    head["pages"] = sorted({p for u in content for p in u["pages"]})
+    head["continues_to"] = content[-1].get("continues_to")
+    if head["continues_to"]:
+        target = ix.get(head["continues_to"]["unit"])
+        if target and target[0].get("continues_from"):
+            target[0]["continues_from"] = {**target[0]["continues_from"], "unit": head["id"]}
+    if head["type"] == "paragraph":
+        head["line_breaks"] = None
+    head["provenance"] = _prov(head, f"{len(content)} items merged by the reviewer")
+
+
+def merge(data, ix, edit):
+    siblings, units, first, last = _units(ix, edit.get("units") or [])
+    content = [u for u in units if u["type"] != "page_marker"]
+    if len(content) < 2:
+        raise EditError("Select at least two items to merge.")
+    kinds = {u["type"] for u in content}
+    if len(kinds) != 1 or kinds.pop() not in TEXT_TYPES:
+        raise EditError("Only items of one kind (paragraphs, headings, captions, footnotes or "
+                        "list items) can be merged.")  # fmt: skip
+    if any(u.get("children") for u in content[1:]):
+        raise EditError("A list item with a list inside it cannot be merged into another item.")
+    _merge_units(ix, content)
+    gone = {id(u) for u in content[1:]}
+    marks = _markers_out(siblings, first, last)
+    kept = [u for u in siblings[first : last + 1] if id(u) not in gone and u["type"] != "page_marker"]
+    _replace_run(siblings, first, last, [*kept, *marks])
+
+
+SPLITTABLE = ("paragraph", "list_item", "footnote")
+
+
+def reading_words(content: dict) -> list[tuple[str, int]]:
+    """The words of a text as the book reads it, each with the offset of its first character in
+    the stored text (a word cut at a line end is one word, at the offset of its first part)."""
+    from book_adapters.engine.text import render
+
+    text = (content.get("text") or "").replace("\b", " ")
+    chars = render({**content, "text": text}, [(0, len(text))], text)
+    read = "".join(c for c, _ in chars)
+    return [(m.group(), chars[m.start()][1]) for m in re.finditer(r"\S+", read)]
+
+
+def split_word(data, ix, edit):
+    """A paragraph, list item or footnote becomes two: the second starts at the word the reviewer
+    chose (``offset``: where that word starts in the stored text). Every character stays in one of
+    the two; the white space between them goes with neither. A list item keeps its marker on the
+    first part and its inner list on the second."""
+    unit, siblings = _get(ix, edit["unit"])
+    if unit["type"] not in SPLITTABLE:
+        raise EditError("Only a paragraph, a list item or a footnote can be split.")
+    content = unit["content"]
+    text = content["text"]
+    try:
+        at = int(edit["offset"])
+    except (KeyError, TypeError, ValueError):
+        raise EditError("Click the word where the new paragraph starts.") from None
+    if not 0 < at < len(text):
+        raise EditError("Click a word inside the text, after its first word.")
+    while at < len(text) and text[at].isspace():
+        at += 1
+    cut = at
+    while cut > 0 and text[cut - 1].isspace():
+        cut -= 1
+    first, second = slice_content(content, 0, cut), slice_content(content, at)
+    if not first["text"].strip() or not second["text"].strip():
+        raise EditError("Both parts of a split need text.")
+    new = copy.deepcopy(unit)
+    new["id"] = new_id(unit["id"], "split_word", str(at))
+    if new["id"] in ix:
+        raise EditError("This block is already split there.")
+    refs = unit.get("refs") or {"lines": [], "spans": []}
+    starts = line_starts(text)
+    line = max(i for i, s in enumerate(starts) if s <= at)
+    inside = at != starts[line]  # the new part starts in the middle of a printed line
+    if len(refs.get("lines") or ()) == len(starts):
+        unit["refs"] = {**refs, "lines": refs["lines"][: line + 1 if inside else line]}
+        new["refs"] = {**refs, "lines": refs["lines"][line:]}
+    box = unit.get("boxes") or []
+    if len(box) == 1:
+        b = box[0]
+        line_end = text.find("\n", at)
+        width = (len(text) if line_end < 0 else line_end) - starts[line]
+        part = (at - starts[line]) / width if width else 0
+        y = round(b["y0"] + (b["y1"] - b["y0"]) * (line + part) / len(starts), 2)
+        unit["boxes"] = [{**b, "y1": y}]
+        new["boxes"] = [{**b, "y0": y}]
+    unit["content"], new["content"] = first, second
+    new["continues_from"] = None
+    new["continues_to"] = unit.get("continues_to")
+    unit["continues_to"] = None
+    if new["continues_to"]:
+        target = ix.get(new["continues_to"]["unit"])
+        if target and target[0].get("continues_from"):
+            target[0]["continues_from"] = {**target[0]["continues_from"], "unit": new["id"]}
+    if unit["type"] == "list_item":
+        new["marker"] = None
+        unit["children"] = []
+    else:
+        for u in (unit, new):
+            if u["type"] == "paragraph":
+                u["line_breaks"] = None
+    reason = f"split before the word at offset {at} by the reviewer"
+    unit["provenance"] = _prov(unit, reason)
+    new["provenance"] = _prov(new, reason)
+    siblings.insert(siblings.index(unit) + 1, new)
+
+
+def _pieces(unit: dict) -> list[dict]:
+    """The text-bearing units inside one unit, in reading order (a list: its items, nested
+    lists after their item; a box: its children)."""
+    kind = unit["type"]
+    if kind in TEXT_TYPES:
+        return [unit, *(p for c in unit.get("children") or [] for p in _pieces(c))]
+    if kind in ("list", "box"):
+        return [p for c in unit.get("items" if kind == "list" else "children") or []
+                for p in _pieces(c)]  # fmt: skip
+    if kind == "page_marker":
+        return []
+    raise EditError("Only text, a list, a box, a table or a picture with text can become a paragraph.")
+
+
+def _with_mark(content: dict, item: dict) -> dict:
+    """A list item's text with its printed mark in front when the mark holds a letter or a
+    number ("3.", "(a)"): that is text and must stay. Bullets and dashes are no text."""
+    mark = (item.get("marker") or {}).get("text") or ""
+    if not re.search(r"[^\W_]", mark):
+        return content
+    shift = len(mark) + 1
+    out = copy.deepcopy(content)
+    out["text"] = f"{mark} {content['text']}"
+    out["spans"] = [{**s, "start": s["start"] + shift, "end": s["end"] + shift} for s in content.get("spans") or ()]
+    out["joins"] = [{**j, "at": j["at"] + shift,
+                     "hyphen_at": None if j.get("hyphen_at") is None else j["hyphen_at"] + shift}
+                    for j in content.get("joins") or ()]  # fmt: skip
+    out["raw"], out["source_runs"] = None, []
+    return out
+
+
+def to_paragraph(data, ix, edit):
+    ids = list(edit.get("units") or [])
+    per_item = bool(edit.get("per_item"))
+    if not ids:
+        raise EditError("Select at least one block.")
+    changed = False
+    flat: list[str] = []
+    for uid in ids:  # a table or a picture first gives its text as paragraphs
+        unit, siblings = _get(ix, uid)
+        if unit["type"] in ("table", "figure"):
+            at, count = siblings.index(unit), len(siblings)
+            unwrap(data, ix, {"unit": uid})
+            flat += [u["id"] for u in siblings[at : at + len(siblings) - count + 1]]
+            ix, changed = index_units(data), True
+        else:
+            flat.append(uid)
+    first_unit, _ = _get(ix, flat[0])
+    parent_list = holder = None
+    if first_unit["type"] == "list_item":
+        chain = _ancestors(data["content"], first_unit["id"]) or []
+        if not chain or chain[-1][0]["type"] != "list":
+            raise EditError("These list items are not in a list.")
+        parent_list, holder = chain[-1]
+    siblings, units, first, last = _units(ix, flat)
+    content = [u for u in units if u["type"] != "page_marker"]
+    if parent_list is not None and any(u["type"] != "list_item" for u in content):
+        raise EditError("Choose list items only, or the whole list.")
+    pieces = [p for u in content for p in _pieces(u)]
+    if not pieces or any(not (p.get("content") or {}).get("text", "").strip() for p in pieces):
+        raise EditError("Every block needs text to become part of a paragraph.")
+    made = []
+    for p in pieces:
+        new = _plain(p, "paragraph", "made a body paragraph by the reviewer")
+        new["flags"] = [f for f in new.get("flags") or [] if f != "chapter_authors"]
+        new["content"] = _with_mark(new["content"], p)
+        made.append(new)
+    spaced = _spaced([m["content"] for m in made])
+    for m in made:
+        m["content"] = _resolve_breaks(m["content"], spaced)
+    if len(made) > 1 and not per_item:
+        _merge_units(ix, made)
+        made = made[:1]
+        made[0]["provenance"] = _prov(made[0], f"{len(pieces)} blocks made one paragraph by the reviewer")
+    marks = _markers_out(siblings, first, last)
+    if parent_list is None:
+        _replace_run(siblings, first, last, [*made, *marks])
+    else:  # some items of a list: the items before and after stay lists
+        items = parent_list["items"]
+        a, b = items.index(units[0]), items.index(units[-1])
+        before, after = items[:a], items[b + 1 :]
+        out = []
+        if before:
+            parent_list["items"] = before
+            out.append(parent_list)
+        out += [*made, *marks]
+        if after:
+            tail = copy.deepcopy(parent_list) if before else parent_list
+            tail["items"] = after
+            if before:
+                tail["id"] = new_id(parent_list["id"], "tail", after[0]["id"])
+                tail["list_id"] = new_id(parent_list.get("list_id", ""), "tail", after[0]["id"])
+            out.append(tail)
+        at = holder.index(parent_list)
+        holder[at : at + 1] = out
+    gone = {u["id"] for u in pieces if u["type"] == "heading"}
+    outline = (data.get("navigation") or {}).get("outline")
+    if outline and gone:
+        data["navigation"]["outline"] = [e for e in outline if e.get("heading") not in gone]
+
+
+def move(data, ix, edit):
+    unit, siblings = _get(ix, edit["unit"])
+    direction = edit.get("direction")
+    if direction not in ("up", "down"):
+        raise EditError("A block moves up or down.")
+    i = siblings.index(unit)
+    step = -1 if direction == "up" else 1
+    j = i + step
+    while 0 <= j < len(siblings) and siblings[j]["type"] == "page_marker":
+        j += step
+    if not 0 <= j < len(siblings):
+        raise EditError(f"This is already the {'first' if step < 0 else 'last'} item here.")
+    siblings[i], siblings[j] = siblings[j], siblings[i]
+
+
+def swap_columns(data, ix, edit):
+    """The run of units on the unit's page, starting at the unit, is read before the units of
+    that page above it in the reading order (the person points at the first block of the
+    column that comes first)."""
+    unit, siblings = _get(ix, edit["unit"])
+    page = unit["pages"][0]
+    i = siblings.index(unit)
+    on_page = [k for k, u in enumerate(siblings)
+               if u["type"] != "page_marker" and u["pages"][0] == page]  # fmt: skip
+    start = on_page[0]
+    if i == start:
+        raise EditError("Choose the first block of the column that should be read first; this "
+                        "block already starts the page.")  # fmt: skip
+    end = on_page[-1]
+    if any(siblings[k]["type"] != "page_marker" and siblings[k]["pages"][0] != page
+           for k in range(start, end + 1)):  # fmt: skip
+        raise EditError("Other pages' text lies between the blocks of this page.")
+    run = siblings[start : end + 1]
+    pos = run.index(unit)
+    siblings[start : end + 1] = run[pos:] + run[:pos]
+
+
+def _texts_of(node):
+    """(content, refs, id hint) of every text record of a table cell item, depth first."""
+    if isinstance(node, dict):
+        marker = node.get("marker")
+        if isinstance(marker, dict) and marker.get("text"):
+            yield marker, {"lines": [], "spans": []}
+        content = node.get("content")
+        if isinstance(content, dict) and "text" in content:
+            yield content, node.get("refs") or {"lines": [], "spans": []}
+        elif isinstance(content, list):
+            for item in content:
+                yield from _texts_of(item)
+        for key in ("items", "children"):
+            for child in node.get(key) or ():
+                yield from _texts_of(child)
+
+
+def _paragraph_of(owner: dict, key: str, n: int, content: dict, refs: dict, box_, reason: str):
+    return {
+        "id": new_id(owner["id"], "unwrap", key, str(n)),
+        "type": "paragraph",
+        "pages": list(owner.get("pages") or [(box_ or {}).get("page", 1)]),
+        "order": owner.get("order", 0),
+        "boxes": [copy.deepcopy(box_)] if box_ else [],
+        "confidence": 1.0,
+        "continues_from": None,
+        "continues_to": None,
+        "flags": [],
+        "role": "body",
+        "line_breaks": None,
+        "content": copy.deepcopy(content),
+        "refs": copy.deepcopy(refs),
+        "provenance": _prov(owner, reason),
+        "review_status": "ok",
+        "source": owner.get("source") or "native",
+    }
+
+
+def unwrap(data, ix, edit):
+    unit, siblings = _get(ix, edit["unit"])
+    reason = f"{unit['type']} unwrapped by the reviewer"
+    out: list[dict] = []
+    if unit["type"] == "box":
+        out = list(unit.get("children") or [])
+    elif unit["type"] == "table":
+        records = []
+        if unit.get("title"):
+            records.append((unit["title"]["content"], unit["title"].get("refs"), None))
+        for cell in sorted(unit.get("cells") or [], key=lambda c: (c["row"], c["column"])):
+            for item in cell.get("content") or []:
+                records += [(c, r, cell.get("box")) for c, r in _texts_of(item)]
+        for note in unit.get("notes") or []:
+            records.append((note["content"], note.get("refs"), None))
+        out = [_paragraph_of(unit, "t", n, c, r or {"lines": [], "spans": []}, b, reason)
+               for n, (c, r, b) in enumerate(records)]  # fmt: skip
+    elif unit["type"] == "figure":
+        records = []
+        for key in ("text", "captions", "credits"):
+            for rec in unit.get(key) or []:
+                if isinstance(rec.get("content"), dict):
+                    records.append((rec["content"], rec.get("refs")))
+        box_ = (unit.get("boxes") or [None])[0]
+        out = [_paragraph_of(unit, "f", n, c, r or {"lines": [], "spans": []}, box_, reason)
+               for n, (c, r) in enumerate(records)]  # fmt: skip
+    else:
+        raise EditError("Only a table, a figure or a box can be unwrapped.")
+    if not out:
+        raise EditError("There is no text in it to take out.")
+    siblings[siblings.index(unit) : siblings.index(unit) + 1] = out
+
+
+def table_split(data, ix, edit):
+    table, siblings = _get(ix, edit["unit"])
+    if table["type"] != "table":
+        raise EditError("Choose a table to split.")
+    rows = sorted({c["row"] for c in table.get("cells") or []})
+    at = int(edit.get("row") or 0)
+    if not 2 <= at <= len(rows):
+        raise EditError(f"Split before a row from 2 to {len(rows)}.")
+    cut = rows[at - 1]
+    if any(c["row"] < cut < c["row"] + c.get("row_span", 1) for c in table["cells"]):
+        raise EditError("A cell reaches across that row, so the table cannot split there.")
+    second = copy.deepcopy(table)
+    top = [c for c in table["cells"] if c["row"] < cut]
+    low = [c for c in second["cells"] if c["row"] >= cut]
+    for c in low:
+        c["row"] -= cut
+    table["cells"], second["cells"] = top, low
+    table["rows"], second["rows"] = at - 1, len(rows) - at + 1
+    second["header_rows"] = 0
+    table["header_rows"] = min(table.get("header_rows") or 0, table["rows"])
+    table["notes"], second["title"] = [], None
+    table["continues_to"], second["continues_from"] = None, None
+    for part, cells in ((table, top), (second, low)):
+        pages = sorted({c["box"]["page"] for c in cells if c.get("box")}) or part["pages"]
+        part["pages"] = pages
+        part["boxes"] = [b for b in part.get("boxes") or [] if b.get("page") in pages] or part.get("boxes") or []
+        part["refs"] = {"lines": [], "spans": []}
+        part["provenance"] = _prov(table, f"table split before row {at} by the reviewer")
+        part["review_status"] = "ok"
+    second["id"] = new_id(table["id"], "split", str(at))
+    siblings.insert(siblings.index(table) + 1, second)
+
+
+OPS = {
+    "list_set": list_set, "list_level": list_level, "box": box, "caption": caption,
+    "table_make": table_make, "table_text": table_text, "footnote": footnote,
+    "paragraph": paragraph, "chapter_authors": chapter_authors, "question": question,
+    "bibliography": bibliography, "index_entries": index_entries, "glossary": glossary,
+    "not_content": not_content, "merge": merge, "split_word": split_word, "to_paragraph": to_paragraph, "move": move, "swap_columns": swap_columns,
+    "unwrap": unwrap, "table_split": table_split, "restore_line": restore_line, "remove_char": remove_char,
+    "remove_block": remove_block, "add_block": add_block, "edit_text": edit_text,
+}  # fmt: skip
+
+
+def touched(edit: dict) -> list[str]:
+    """The unit ids an edit names (to update only those rows in the browser)."""
+    ids = list(edit.get("units") or [])
+    for key in ("unit", "figure", "table", "line", "anchor"):
+        if edit.get(key):
+            ids.append(edit[key])
+    return ids
+
+
+__all__ = ["OPS", "index_units", "number_mark", "touched"]

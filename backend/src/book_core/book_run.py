@@ -1,0 +1,1368 @@
+"""End-to-end Stage 1 runner: deterministic page work, resumable development caches.
+
+Production uses an automatically cleaned temporary cache and publishes only final,
+span-referencing units, book decisions and their source span stores. No adapter is run.
+"""
+
+import hashlib
+import importlib.util
+import json
+import multiprocessing
+import os
+import queue
+import shutil
+import signal
+import tempfile
+import threading
+import time
+import traceback
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+
+from book_core.cache_admin import RUN_STAGES, cache_lock, disk_check, disk_need, register
+from book_core.cache_store import read_json, read_model, validated_reads, write_json, write_model
+from book_core.caching import code_digest
+from book_core.characters.cache import analyze_book_characters
+from book_core.characters.cache import load_page as character_page
+from book_core.continuity.cache import PageInput, analyze_book_continuity
+from book_core.equations.cache import analyze_book_equations
+from book_core.equations.cache import load_page as equation_page
+from book_core.equations.ownership import final_figures
+from book_core.extraction.fingerprints import source_digest, stable_id
+from book_core.extraction.pymupdf_backend import PyMuPDFExtractor
+from book_core.figures.cache import analyze_book_figures, image_path
+from book_core.figures.cache import load_page as figure_page
+from book_core.figures.settings import FigureSettings
+from book_core.mathml.cache import analyze_book_mathml
+from book_core.mathml.cache import image_path as math_image_path
+from book_core.mathml.cache import load_page as math_page
+from book_core.model.spans import ExtractedPage
+from book_core.objects.analysis import (
+    analyze_page,
+    atomic_write,
+    cached_repetition,
+    fingerprints,
+    verified_read,
+)
+from book_core.objects.models import NativeObjectPage
+from book_core.paint.cache import paint_fingerprint
+from book_core.process_metrics import ProcessMonitor
+from book_core.run_context import source_session
+from book_core.settings import Settings
+from book_core.tables.cache import analyze_book_tables
+from book_core.tables.cache import load_page as table_page
+from book_core.tables.settings import TableSettings
+from book_core.tables.view import unit_view, without_figures
+from book_core.telemetry import available_memory, measure, memory
+
+# Dense native vector pages can exceed 8 GB while being decoded and validated.
+WORKER_MEMORY_BYTES = 12 * 1024**3
+
+
+def final_producer_digest():
+    return code_digest("final")
+
+
+LOADED_FINAL_DIGEST = final_producer_digest()
+
+
+class StageFailure(RuntimeError):
+    """A stage failed. Names the stage, the page for page stages, and the original error."""
+
+    def __init__(self, stage, page, error_type, message, details=None):
+        where = f" on page {page}" if page is not None else ""
+        super().__init__(f"Stage {stage} failed{where}: {error_type}: {message}")
+        self.stage, self.page, self.error_type = stage, page, error_type
+        self.message, self.details = message, details
+
+    def __reduce__(self):
+        return (
+            StageFailure,
+            (self.stage, self.page, self.error_type, self.message, self.details),
+        )
+
+
+@contextmanager
+def stage(target, name, page=None):
+    """``measure`` a stage; any failure inside becomes a StageFailure naming stage and page."""
+    from pydantic import ValidationError
+
+    with measure(target, name) as counters:
+        try:
+            yield counters
+        except StageFailure:
+            raise
+        except Exception as error:
+            details = (
+                json.loads(error.json(include_url=False))
+                if isinstance(error, ValidationError)
+                else None
+            )
+            raise StageFailure(name, page, type(error).__name__, str(error), details) from error
+
+
+def _terminate(signum, frame):
+    raise SystemExit(f"terminated by signal {signum}")
+
+
+@contextmanager
+def failure_record(root):
+    """Every failed run leaves ``failures/<UTC time>.json`` under its cache root (never in the
+    output folder, which an interrupted production run leaves empty): stage, page, error,
+    traceback.
+
+    A termination request (SIGTERM, as at shutdown) becomes an exception too, so a stopped
+    run is recorded; completed pages stay cached and a rerun resumes from them."""
+    started = datetime.now(UTC)
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGTERM, _terminate)
+    try:
+        yield
+    except BaseException as error:
+        failure = error if isinstance(error, StageFailure) else None
+        record = {
+            "outcome": "failed",
+            "started": started.isoformat(),
+            "failed": datetime.now(UTC).isoformat(),
+            "stage": failure.stage if failure else None,
+            "page": failure.page if failure else None,
+            "error_type": failure.error_type if failure else type(error).__name__,
+            "message": failure.message if failure else str(error),
+            "details": failure.details if failure else None,
+            "traceback": traceback.format_exc(),
+        }
+        name = started.strftime("%Y%m%dT%H%M%S%fZ") + ".json"
+        path = Path(root) / "failures" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=1, ensure_ascii=False) + "\n", "utf-8")
+        raise
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def clocks():
+    """(monotonic, boot-time) seconds. Boot time also counts sleep where the platform
+    reports it (Linux); elsewhere it is None and sleep is not separated."""
+    boot = getattr(time, "CLOCK_BOOTTIME", None)
+    return time.monotonic(), (time.clock_gettime(boot) if boot is not None else None)
+
+
+_WORKER_JOB = None
+
+
+MODEL_THREADS = 1  # torch threads of every model stage: scores depend on the thread count
+
+
+def fix_model_threads():
+    """Model scores (layout detections, table readings) differ in the last digits between
+    thread counts, so every run, in this process and in each worker, uses the same count:
+    the one the cached detections were computed with. A no-op without torch."""
+    if importlib.util.find_spec("torch") is None:
+        return
+    import torch
+
+    if torch.get_num_threads() != MODEL_THREADS:
+        torch.set_num_threads(MODEL_THREADS)
+
+
+def sorted_key_inputs(value):
+    """The payload with every ``cache_key_inputs`` mapping in sorted key order: the records are
+    built from sets and merged mappings, so their order depends on the worker count."""
+    if isinstance(value, dict):
+        return {
+            key: dict(sorted(item.items())) if key == "cache_key_inputs" and isinstance(item, dict)
+            else sorted_key_inputs(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sorted_key_inputs(item) for item in value]
+    return value
+
+
+def _announce(channel, snapshot, function, arguments):
+    global _WORKER_JOB
+    fix_model_threads()
+    _WORKER_JOB = (snapshot, function, arguments)
+    channel.put(os.getpid())
+
+
+def _dispatch(number):
+    snapshot, function, arguments = _WORKER_JOB
+    return function(snapshot, number, *arguments)
+
+
+def _worker_measurement(measured):
+    measured["_worker"] = {
+        "pid": os.getpid(),
+        "cpu_seconds": time.process_time(),
+        "peak_rss_bytes": memory()[1],
+    }
+    return measured
+
+
+def native_settings(settings):
+    """The job settings the semantic stages see: never the OCR part. OCR assets and OCR
+    requests configure only the OCR evidence source, so they cannot change a native page."""
+    if hasattr(settings, "ocr"):
+        return Settings.model_validate(settings.model_dump(exclude={"ocr"}))
+    return settings
+
+
+def default_workers():
+    return max(
+        1, min(2, os.cpu_count() or 1, (available_memory() - 2 * 1024**3) // WORKER_MEMORY_BYTES)
+    )
+
+
+def _page_job(snapshot, number, root, repetition, device, ocr_input=None):
+    """One page per future; return small measurements, never large evidence payloads."""
+    from book_core.layout.pipeline import analyze_layout
+
+    root = Path(root)
+    measured = {}
+    with source_session(snapshot.path, snapshot), validated_reads():
+        extractor = PyMuPDFExtractor(device)
+        if ocr_input is not None:
+            from book_core.ocr.extractor import OcrExtractor
+
+            extractor = OcrExtractor(extractor, ocr_input)
+        native_key, _ = fingerprints(snapshot.digest, extractor, repetition)
+        path = root / "native" / native_key / f"{number}.json"
+        with stage(measured, "native", number):
+            if path.exists():
+                native = verified_read(path, NativeObjectPage, native_key)
+            else:
+                native = extractor.extract_object_page(snapshot.path, number)
+                if (
+                    native.page.source_sha256 != snapshot.digest
+                    or native.page.geometry.page != number
+                ):
+                    raise ValueError("Extractor returned another source/page")
+                snapshot.check()
+                atomic_write(path, native, native_key)
+            text_path = root / "text" / native_key / f"{number}.json"
+            if not text_path.exists():
+                write_model(text_path, native.page, native_key)
+        with stage(measured, "analysis", number):
+            analysis = analyze_page(
+                snapshot.path, number, extractor, repetition, root, native=native
+            )
+            if ocr_input is not None and number in ocr_input.page_keys:
+                from book_core.objects.analysis import write_analysis
+                from book_core.ocr.extractor import apply_scan_roles
+
+                analysis = apply_scan_roles(analysis, ocr_input, number)
+                _, analysis_key = fingerprints(snapshot.digest, extractor, repetition)
+                write_analysis(
+                    root / "analysis" / analysis_key / f"{number}.json",
+                    analysis,
+                    analysis_key,
+                    native_key,
+                )
+        with stage(measured, "layout", number):
+            analyze_layout(snapshot.path, number, extractor, repetition, root, analysis=analysis)
+    return _worker_measurement(measured)
+
+
+def _order_job(snapshot, number, root, repetition, vocabulary, device, ocr_input=None):
+    from book_core.caching import assert_producer_unchanged
+    from book_core.layout.models import PageLayout
+    from book_core.layout.pipeline import layout_fingerprint
+    from book_core.reading_order.builder import build_reading_order
+    from book_core.reading_order.cache import LOADED_CODE_DIGEST, order_fingerprint
+    from book_core.reading_order.models import PageReadingOrder
+
+    root, measured = Path(root), {}
+    with source_session(snapshot.path, snapshot), stage(measured, "reading_order", number):
+        assert_producer_unchanged("reading_order", LOADED_CODE_DIGEST)
+        extractor = PyMuPDFExtractor(device)
+        if ocr_input is not None:
+            from book_core.ocr.extractor import OcrExtractor
+
+            extractor = OcrExtractor(extractor, ocr_input)
+        native_key, analysis_key = fingerprints(snapshot.digest, extractor, repetition)
+        layout_key = layout_fingerprint(analysis_key, extractor.device.resolved)
+        key = order_fingerprint(layout_key, vocabulary)
+        path = root / "reading_order" / key / f"{number}.json"
+        if path.exists():
+            verified_read(path, PageReadingOrder, key)
+        else:
+            page = read_model(
+                root / "text" / native_key / f"{number}.json", ExtractedPage, native_key
+            )
+            layout = verified_read(
+                root / "layout" / layout_key / f"{number}.json", PageLayout, layout_key
+            )
+            order = build_reading_order(layout, page.store, vocabulary, extractor.device.resolved)
+            assert_producer_unchanged("reading_order", LOADED_CODE_DIGEST)
+            atomic_write(path, order, key)
+    return _worker_measurement(measured)
+
+
+def _merge_measurements(target, row, worker_stats, phase):
+    worker = row.pop("_worker")
+    worker_stats[f"{phase}/{worker['pid']}"] = worker
+    for stage, stats in row.items():
+        values = target.setdefault(stage, {})
+        for name, value in stats.items():
+            if name == "peak_rss_bytes":
+                values[name] = max(values.get(name, 0), value)
+            else:
+                values[name] = values.get(name, 0) + value
+
+
+def _page_pool(
+    function, snapshot, total, workers, arguments, measurements, progress, monitor, worker_stats
+):
+    if workers == 1:
+        for number in range(1, total + 1):
+            _merge_measurements(
+                measurements,
+                function(snapshot, number, *arguments),
+                worker_stats,
+                function.__name__,
+            )
+            if progress:
+                progress(function.__name__, number, total)
+        return
+    # A bounded queue prevents whole-book page payloads/futures accumulating in RAM.
+    context = multiprocessing.get_context("spawn")
+    channel = context.Queue()
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=context,
+            initializer=_announce,
+            initargs=(channel, snapshot, function, arguments),
+        ) as pool:
+            pages = iter(range(1, total + 1))
+            pending = {}
+            for _ in range(min(total, 2 * workers)):
+                number = next(pages)
+                pending[pool.submit(_dispatch, number)] = number
+            completed = 0
+            while pending:
+                while True:
+                    try:
+                        monitor.add(channel.get_nowait())
+                    except queue.Empty:
+                        break
+                done, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future)
+                    _merge_measurements(
+                        measurements, future.result(), worker_stats, function.__name__
+                    )
+                    completed += 1
+                    if progress:
+                        progress(function.__name__, completed, total)
+                    number = next(pages, None)
+                    if number is not None:
+                        pending[pool.submit(_dispatch, number)] = number
+    finally:
+        channel.close()
+        channel.join_thread()
+
+
+class CachedTextPages:
+    """Extractor interface over validated native text, without loading visual evidence."""
+
+    def __init__(self, extractor, root, key, count, digest):
+        self.extractor, self.root, self.key = extractor, Path(root), key
+        self.count, self.digest = count, digest
+
+    @property
+    def identity(self):
+        return self.extractor.identity
+
+    def extract_pages(self, source):
+        if source_digest(Path(source)) != self.digest:
+            raise ValueError("Cached text source mismatch")
+        for number in range(1, self.count + 1):
+            page = read_model(
+                self.root / "text" / self.key / f"{number}.json", ExtractedPage, self.key
+            )
+            if page.source_sha256 != self.digest or page.geometry.page != number:
+                raise ValueError("Cached text page identity mismatch")
+            yield page
+
+
+def _navigation_map(navigation):
+    mapping = {}
+    for entry in navigation.get("printed_entries", []):
+        for line in entry["line_ids"]:
+            mapping.setdefault(entry["source_page"], {})[line] = entry["id"]
+    return mapping
+
+
+def run_book(
+    source,
+    output_dir,
+    cache_dir,
+    *,
+    mode="development",
+    workers=None,
+    settings=None,
+    device="auto",
+    evidence=None,
+    vocabulary=None,
+    cache_dirs=None,
+    progress=None,
+    estimated_bytes_per_page=12 * 1024**2,
+    figure_settings=None,
+    alt_text_generator=None,
+    figure_evidence=None,
+    model_cache_dir=None,
+    math_settings=None,
+    formula_reader=None,
+    table_settings=None,
+    table_evidence=None,
+    table_reader=None,
+    ocr_input=None,
+    profile=None,
+    run_date=None,
+    book_parts=None,
+):
+    """Run all implemented stages; optional read-only whole-book evidence may be supplied.
+
+    ``profile``: the client profile (a ``ClientProfile``, a profile file, or None for the
+    default profile); ``run_date``: written into the book JSON outside its content hash.
+
+    cache_dirs is an integration hook for already established stage cache locations.
+    All such locations must be inside cache_dir. No external reference is discovered here.
+    """
+    fix_model_threads()
+    if mode not in {"development", "production"}:
+        raise ValueError("Mode must be development or production")
+    workers = default_workers() if workers is None else workers
+    if workers < 1:
+        raise ValueError("Worker count must be positive")
+    if estimated_bytes_per_page <= 0:
+        raise ValueError("Disk estimate must be positive")
+    settings = settings or Settings()
+    # Models are provisioned explicitly at pinned revisions; a run never reaches the network.
+    # Without an explicit directory they come from the project model cache next to the caches.
+    model_cache_dir = Path(model_cache_dir) if model_cache_dir else Path(cache_dir) / "huggingface"
+    settings = native_settings(settings)
+    from book_core.assembly.profile import ClientProfile, load_profile
+    from book_core.figures.evidence import resolve
+
+    explicit_profile = profile is not None
+    profile = profile if isinstance(profile, ClientProfile) else load_profile(profile)
+    figure_settings = figure_settings or FigureSettings()
+    if explicit_profile:
+        figure_settings = figure_settings.model_copy(
+            update={"alt_text_drafts": profile.alt_text.mode == "model_draft"}
+        )
+
+    figure_settings, evidence_warning = resolve(figure_settings, figure_evidence)
+    if figure_settings.alt_text_drafts and alt_text_generator is None:
+        from book_core.figures.alt_text import DraftGenerator
+
+        alt_text_generator = DraftGenerator(
+            device=device, cache_dir=model_cache_dir, local_files_only=True
+        )
+    figures = (figure_settings, alt_text_generator, figure_evidence, model_cache_dir, device)
+    from book_core.mathml.settings import MathSettings
+    from book_core.mathml.settings import resolve as resolve_math
+
+    math_settings, math_warning = resolve_math(math_settings or MathSettings(), formula_reader)
+    maths = (math_settings, formula_reader, model_cache_dir, device)
+    from book_core.tables.settings import resolve as resolve_tables
+    from book_core.tables.settings import resolve_reader
+
+    table_settings, table_warning = resolve_tables(
+        table_settings or TableSettings(), table_evidence
+    )
+    table_settings, reader_warning = resolve_reader(table_settings, table_reader)
+    tabling = (table_settings, table_evidence, model_cache_dir, device, table_reader)
+    from book_core.assembly.cache import settings_digest
+
+    publishing = (
+        profile,
+        run_date,
+        settings_digest(settings, figure_settings, math_settings, table_settings),
+    )
+    if final_producer_digest() != LOADED_FINAL_DIGEST:
+        raise RuntimeError("Book runner producer changed; restart the worker")
+    source, output_dir, cache_dir = (
+        Path(source).resolve(),
+        Path(output_dir).resolve(),
+        Path(cache_dir).resolve(),
+    )
+    if mode == "production" and cache_dirs:
+        raise ValueError("Production always uses its own temporary intermediate cache")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stats = {
+        "mode": mode,
+        "workers": workers,
+        "stages": {},
+        "worker_processes": {},
+        "figure_model_evidence": figure_settings.model_evidence,
+        "warnings": [
+            w for w in (evidence_warning, math_warning, table_warning, reader_warning) if w
+        ],
+        "image_recognition": math_settings.image_recognition,
+    }
+    awake, booted = clocks()
+    with (
+        failure_record(cache_dir),
+        ProcessMonitor() as monitor,
+        measure(stats, "total"),
+        source_session(source) as snapshot,
+    ):
+        extractor = PyMuPDFExtractor(device)
+        if ocr_input is not None:
+            from book_core.ocr.extractor import OcrExtractor
+
+            if ocr_input.source_sha256 != snapshot.digest:
+                raise ValueError("OCR inputs belong to another source")
+            extractor = OcrExtractor(extractor, ocr_input)
+        total = extractor.page_count(source)
+        stats["pages"] = total
+        # Temporary files go on the output volume, so estimate that volume as well.
+        with cache_lock(cache_dir):
+            # The real need: stages this book has not cached under the current producers,
+            # and the final archive (an empty cache needs the full estimate).
+            need = disk_need(
+                cache_dir,
+                snapshot.digest,
+                total,
+                estimated_bytes_per_page,
+                {stage: stage_producer(stage) for stage in RUN_STAGES},
+            )
+            estimate = need["estimated_bytes"]
+            stats["disk"] = {**disk_check(cache_dir, estimate), "need": need}
+            if output_dir.anchor != cache_dir.anchor:
+                disk_check(output_dir, estimate)
+            if mode == "production":
+                with tempfile.TemporaryDirectory(prefix="book-core-", dir=output_dir) as temporary:
+                    _run(
+                        snapshot,
+                        extractor,
+                        Path(temporary),
+                        output_dir,
+                        settings,
+                        workers,
+                        evidence,
+                        vocabulary,
+                        None,
+                        figures,
+                        maths,
+                        tabling,
+                        stats,
+                        progress,
+                        monitor,
+                        persistent=False,
+                        publishing=publishing,
+                        book_parts=book_parts,
+                    )
+            else:
+                _run(
+                    snapshot,
+                    extractor,
+                    cache_dir,
+                    output_dir,
+                    settings,
+                    workers,
+                    evidence,
+                    vocabulary,
+                    cache_dirs,
+                    figures,
+                    maths,
+                    tabling,
+                    stats,
+                    progress,
+                    monitor,
+                    persistent=True,
+                    publishing=publishing,
+                    book_parts=book_parts,
+                )
+    stats["peak_tree_rss_bytes"] = monitor.peak
+    now_awake, now_booted = clocks()
+    # Machine sleep during the run (wall times include it); None where not measurable.
+    stats["suspended_seconds"] = (
+        round(max(0.0, (now_booted - booted) - (now_awake - awake)), 3)
+        if booted is not None
+        else None
+    )
+    # Also retain a conservative bound for transients between the 20 ms samples.
+    stats["peak_memory_upper_bound_bytes"] = stats["total"]["peak_rss_bytes"] + (
+        workers if workers > 1 else 0
+    ) * max(
+        (
+            r.get("peak_rss_bytes", 0)
+            for name, r in stats["stages"].items()
+            if name in {"native", "analysis", "layout", "reading_order"}
+        ),
+        default=0,
+    )
+    stats["source_hashes"] = stats["total"].get("source_hashes", 0) + sum(
+        row.get("source_hashes", 0) for row in stats["stages"].values()
+    )
+    stats["source_reads"] = stats["total"].get("source_reads", 0) + sum(
+        row.get("source_reads", 0) for row in stats["stages"].values()
+    )
+    stats["total_cpu_seconds"] = stats["total"]["cpu_seconds"] + (
+        sum(worker["cpu_seconds"] for worker in stats["worker_processes"].values())
+        if workers > 1
+        else 0
+    )
+    return stats
+
+
+def _run(
+    snapshot,
+    extractor,
+    root,
+    output_dir,
+    settings,
+    workers,
+    evidence,
+    vocabulary,
+    cache_dirs,
+    figures,
+    maths,
+    tabling,
+    stats,
+    progress,
+    monitor,
+    *,
+    persistent,
+    publishing=None,
+    book_parts=None,
+):
+    from book_core.document_analysis.metadata import cached_metadata
+    from book_core.document_analysis.navigation import analyze_navigation
+    from book_core.document_analysis.vocabulary import build_vocabulary
+    from book_core.furniture.cache import analyze_book_furniture
+    from book_core.furniture.inputs import PageInputs
+    from book_core.layout.models import PageLayout
+    from book_core.lists.cache import analyze_book_lists
+    from book_core.lists.cache import load_page as list_page
+    from book_core.lists.keys import book_fingerprint as lists_key
+    from book_core.paragraphs.cache import analyze_book_paragraphs
+    from book_core.paragraphs.keys import book_fingerprint as paragraph_key
+    from book_core.structure.cache import analyze_book_structure
+    from book_core.structure.evidence import book_evidence
+    from book_core.structure.keys import decision_fingerprint
+
+    total, stages, source = stats["pages"], stats["stages"], snapshot.path
+    dirs = {stage: root for stage in ("page", "furniture", "paragraphs", "structure", "lists")}
+    dirs["metadata"] = root / "metadata"
+    dirs["detections"] = root
+    dirs.update({k: Path(v).resolve() for k, v in (cache_dirs or {}).items()})
+    if any(path != root and root not in path.parents for path in dirs.values()):
+        raise ValueError("Stage caches must be inside the run's cache root")
+    with validated_reads():
+        with stage(stages, "book_metadata"):
+            repetition = cached_repetition(source, extractor, dirs["page"])
+            metadata = cached_metadata(source, extractor, dirs["metadata"])
+        _page_pool(
+            _page_job,
+            snapshot,
+            total,
+            workers,
+            (
+                dirs["page"],
+                repetition,
+                extractor.device.resolved,
+                getattr(extractor, "inputs", None),
+            ),
+            stages,
+            progress,
+            monitor,
+            stats["worker_processes"],
+        )
+        native_key, analysis_key = fingerprints(snapshot.digest, extractor, repetition)
+        text = CachedTextPages(extractor, dirs["page"], native_key, total, snapshot.digest)
+
+        def pages():
+            return text.extract_pages(source)
+
+        with stage(stages, "book_evidence"):
+            if evidence is not None:
+                if evidence["provenance"]["source_sha256"] != snapshot.digest:
+                    raise ValueError("Whole-book evidence belongs to another source")
+                navigation = evidence["navigation"]
+                if vocabulary is None:
+                    vocabulary = evidence["vocabulary"]["casefold_frequencies"]
+            else:
+                native_pages = list(pages())
+                navigation = analyze_navigation(native_pages, metadata)
+                if vocabulary is None:
+                    vocabulary = build_vocabulary(native_pages)["casefold_frequencies"]
+                del native_pages
+        _page_pool(
+            _order_job,
+            snapshot,
+            total,
+            workers,
+            (
+                dirs["page"],
+                repetition,
+                vocabulary,
+                extractor.device.resolved,
+                getattr(extractor, "inputs", None),
+            ),
+            stages,
+            progress,
+            monitor,
+            stats["worker_processes"],
+        )
+        inputs = PageInputs(source, extractor, repetition, dirs["page"], vocabulary)
+        with stage(stages, "furniture"):
+            furniture, furniture_key, _ = analyze_book_furniture(
+                pages(), inputs, metadata, dirs["furniture"], settings=settings
+            )
+        with stage(stages, "paragraphs"):
+            paragraphs, _ = analyze_book_paragraphs(
+                pages,
+                inputs,
+                furniture,
+                furniture_key,
+                dirs["furniture"],
+                _navigation_map(navigation),
+                dirs["paragraphs"],
+                settings=settings,
+            )
+        with stage(stages, "structure_evidence"):
+            structured_evidence, evidence_key, _ = book_evidence(
+                pages,
+                inputs,
+                furniture,
+                furniture_key,
+                dirs["furniture"],
+                paragraphs,
+                dirs["paragraphs"],
+                navigation,
+                dirs["structure"],
+                settings=settings,
+            )
+        with stage(stages, "structure"):
+            structure, _ = analyze_book_structure(
+                structured_evidence,
+                evidence_key,
+                dirs["structure"],
+                config={"book_parts": book_parts} if book_parts else None,
+                device=extractor.device.resolved,
+            )
+        with stage(stages, "lists"):
+            lists, _ = analyze_book_lists(
+                pages,
+                inputs,
+                paragraphs,
+                dirs["paragraphs"],
+                structure,
+                furniture,
+                dirs["lists"],
+                settings=settings,
+            )
+        keys = {
+            "native": native_key,
+            "analysis": analysis_key,
+            "paint": paint_fingerprint(analysis_key, extractor.device.resolved),
+            "text": native_key,
+            "layout": inputs.layout_key,
+            "reading_order": inputs.order_key,
+            "furniture": furniture_key,
+            "paragraphs": paragraph_key(paragraphs.book.cache_key_inputs),
+            "structure_evidence": evidence_key,
+            "structure": decision_fingerprint(
+                structure.cache_key_inputs["structure_producer_sha256"],
+                evidence_key,
+                structure.config,
+                structure.structure_version,
+            ),
+            "lists": lists_key(lists.book.cache_key_inputs),
+        }
+        ocr_input = getattr(extractor, "inputs", None)
+        if ocr_input is not None and (ocr_input.page_keys or ocr_input.comparison_keys):
+            keys["ocr"] = ocr_input.fingerprint
+        with stage(stages, "characters"):
+            keys["characters"] = analyze_book_characters(
+                source,
+                pages,
+                lambda page: inputs(page)[0],
+                lambda number: list_page(lists, number, dirs["lists"]).units,
+                keys["lists"],
+                dirs["page"],
+                total,
+                page_keys={"native": native_key, "layout": inputs.layout_key},
+            )
+        with stage(stages, "figures"):
+            figure_settings, generator, evidence_of, model_cache, policy = figures
+            if figure_settings.model_evidence == "on" and evidence_of is None:
+                from book_core.detection.transformers import (
+                    HeronDetector,
+                    PPDocLayoutV3Detector,
+                )
+                from book_core.figures.evidence import DetectorFigures
+
+                from book_core.detection.parallel import prefetch
+
+                options = {"device": policy, "cache_dir": model_cache, "local_files_only": True}
+                factories = [(HeronDetector, options), (PPDocLayoutV3Detector, options)]
+                evidence_of = DetectorFigures(
+                    source,
+                    extractor,
+                    [factory(**kwargs) for factory, kwargs in factories],
+                    dirs["detections"],
+                )
+                # The figures and equations stages ask both layout models about every page:
+                # compute those detections first in parallel workers (same models, one model
+                # thread each, same cache entries); the stages then read them from the cache.
+                stats["detection_workers"] = prefetch(
+                    source, extractor, factories, dirs["detections"], range(1, total + 1), workers
+                )
+            keys["figures"], figure_book = analyze_book_figures(
+                source,
+                pages,
+                lambda page: inputs(page)[0],
+                lambda number: list_page(lists, number, dirs["lists"]),
+                _NativeObjects(dirs["page"], analysis_key),
+                {m.page: (m.label, m.source) for m in furniture.book.markers},
+                keys["lists"],
+                dirs["page"],
+                total,
+                extractor,
+                figure_settings,
+                generator,
+                evidence_of if figure_settings.model_evidence == "on" else None,
+                page_keys={"analysis": analysis_key},
+            )
+        with stage(stages, "equations"):
+            formulas = None
+            if figure_settings.model_evidence == "on" and hasattr(evidence_of, "detectors"):
+                from book_core.equations.evidence import DetectorFormulas
+
+                formulas = DetectorFormulas(
+                    source, extractor, list(evidence_of.detectors.values()), evidence_of.cache_dir
+                )
+            keys["equations"], equation_book = analyze_book_equations(
+                source,
+                pages,
+                lambda page: inputs(page)[0],
+                lambda number: list_page(lists, number, dirs["lists"]),
+                _NativePages(dirs["page"], native_key),
+                lambda number: character_page(dirs["page"], keys["characters"], number),
+                lambda number: figure_page(dirs["page"], keys["figures"], number),
+                {name: keys[name] for name in ("lists", "characters", "native", "figures")},
+                dirs["page"],
+                total,
+                formulas,
+                page_keys={"native": native_key, "layout": inputs.layout_key},
+            )
+        with stage(stages, "mathml"):
+            math_settings, reader, model_cache, policy = maths
+            if math_settings.image_recognition == "off":
+                reader = None
+            elif reader is None:
+                from book_core.mathml.recognition import PPFormulaNet, RecognitionCache
+
+                reader = RecognitionCache(
+                    PPFormulaNet(device=policy, cache_dir=model_cache, local_files_only=True),
+                    dirs["detections"],
+                )
+            keys["mathml"], math_book = analyze_book_mathml(
+                source,
+                pages,
+                _NativePages(dirs["page"], native_key),
+                lambda number: equation_page(dirs["page"], keys["equations"], number),
+                {m.page: (m.label, m.source) for m in furniture.book.markers},
+                {"equations": keys["equations"], "native": keys["native"]},
+                dirs["page"],
+                total,
+                math_settings,
+                extractor,
+                reader,
+            )
+        with stage(stages, "tables"):
+            table_settings, table_models, model_cache, policy, table_reader = tabling
+            if table_settings.structure_reader == "on" and table_reader is None:
+                from book_core.tables.opinion import TableReader
+                from book_core.tables.recognizers import ReadingCache, TableFormerStructure
+
+                table_reader = TableReader(
+                    source,
+                    extractor,
+                    ReadingCache(
+                        TableFormerStructure(
+                            device=policy, cache_dir=model_cache, local_files_only=True
+                        ),
+                        dirs["detections"],
+                    ),
+                )
+            if table_settings.model_evidence == "on" and table_models is None:
+                from book_core.detection.transformers import (
+                    HeronDetector,
+                    PPDocLayoutV3Detector,
+                )
+                from book_core.tables.detectors import DetectorTables
+                from book_core.tables.recognizers import TATRDetector
+
+                table_models = DetectorTables(
+                    source,
+                    extractor,
+                    {
+                        "heron": HeronDetector(
+                            device=policy, cache_dir=model_cache, local_files_only=True
+                        ),
+                        "pp": PPDocLayoutV3Detector(
+                            device=policy, cache_dir=model_cache, local_files_only=True
+                        ),
+                        "tatr": TATRDetector(
+                            device=policy, cache_dir=model_cache, local_files_only=True
+                        ),
+                    },
+                    dirs["detections"],
+                    table_settings.detection_dpi,
+                )
+
+            def page_figures(number):
+                return final_figures(
+                    figure_page(dirs["page"], keys["figures"], number),
+                    equation_page(dirs["page"], keys["equations"], number),
+                )
+
+            keys["tables"], table_book = analyze_book_tables(
+                pages,
+                lambda page: inputs(page)[0],
+                lambda number: list_page(lists, number, dirs["lists"]),
+                _AnalysisObjects(dirs["page"], analysis_key),
+                page_figures,
+                lambda number: equation_page(dirs["page"], keys["equations"], number),
+                {name: keys[name] for name in ("lists", "analysis", "figures", "equations")},
+                dirs["page"],
+                total,
+                table_settings,
+                table_models if table_settings.model_evidence == "on" else None,
+                {n.page: n.kind for n in structure.navigation_pages},
+                {m.page: (m.label, m.source) for m in furniture.book.markers},
+                tuple(figure_book.profile.get("caption_labels", ())),
+                table_reader if table_settings.structure_reader == "on" else None,
+                strict=persistent,  # production reads a failed cell in source order
+                page_keys={"analysis": analysis_key, "layout": inputs.layout_key},
+            )
+        with stage(stages, "continuity"):
+            labels = {m.page: (m.label, m.source) for m in furniture.book.markers}
+
+            def continuity_inputs():
+                for page in pages():
+                    number = page.geometry.page
+                    built = list_page(lists, number, dirs["lists"])
+                    owning = table_page(dirs["page"], keys["tables"], number).tables
+                    figures_now = without_figures(
+                        page_figures(number), {f for t in owning for f in t.absorbed_figure_ids}
+                    )
+                    yield PageInput(
+                        page=page,
+                        layout=inputs(page)[0],
+                        units=unit_view(built.units, owning)[0],
+                        order=built.order,
+                        tables=owning,
+                        claimed=frozenset(
+                            link.unit_id
+                            for figure in figures_now.figures
+                            for link in (*figure.captions, *figure.credits, *figure.internal_text)
+                        ),
+                        navigation=navigation_kinds.get(number),
+                        label=labels.get(number, (None, "none")),
+                        equations=tuple(
+                            equation_page(dirs["page"], keys["equations"], number).units
+                        ),
+                    )
+
+            navigation_kinds = {n.page: n.kind for n in structure.navigation_pages}
+            keys["continuity"], continuity = analyze_book_continuity(
+                continuity_inputs,
+                (
+                    frozenset(u for h in structure.headings if not h.run_in for u in h.unit_ids),
+                    frozenset(u for h in structure.headings if h.run_in for u in h.unit_ids),
+                ),
+                lists,
+                paragraphs,
+                inputs.vocabulary,
+                {name: keys[name] for name in ("lists", "paragraphs", "tables", "equations")},
+                dirs["page"],
+                total,
+                snapshot.digest,
+            )
+        snapshot.check()
+        with stage(stages, "final_output"):
+
+            def final_pages():
+                for page in pages():
+                    number = page.geometry.page
+                    built = list_page(lists, number, dirs["lists"])
+                    layout = verified_read(
+                        dirs["page"] / "layout" / inputs.layout_key / f"{number}.json",
+                        PageLayout,
+                        inputs.layout_key,
+                    )
+                    unit_lines = {line for unit in built.units for line in unit.line_ids}
+                    line_spans = {
+                        line.id: line.span_ids for line in layout.lines if line.id in unit_lines
+                    }
+                    if set(line_spans) != unit_lines or any(
+                        span not in page.store.spans
+                        for spans in line_spans.values()
+                        for span in spans
+                    ):
+                        raise ValueError("Final units have unresolved line/span references")
+                    equations = equation_page(dirs["page"], keys["equations"], number)
+                    tables = table_page(dirs["page"], keys["tables"], number)
+                    pieces = {f for t in tables.tables for f in t.absorbed_figure_ids}
+                    figures = without_figures(
+                        final_figures(
+                            figure_page(dirs["page"], keys["figures"], number), equations
+                        ),
+                        pieces,
+                    )
+                    view = _table_view(built.units, tables.tables)
+                    links = continuity.links(number)
+                    built = built.model_copy(update={"units": _linked(built.units, links)})
+                    view["added"] = [{**u, **_link_fields(u["id"], links)} for u in view["added"]]
+                    payload = {
+                        "format_version": 1,
+                        "source": page.model_dump(mode="json"),
+                        "units": built.model_dump(mode="json"),
+                        "line_spans": line_spans,
+                        "visibility_evidence": [
+                            proof.model_dump(mode="json") for proof in layout.visibility_evidence
+                        ],
+                        "character_evidence": character_page(
+                            dirs["page"], keys["characters"], number
+                        ).model_dump(mode="json", exclude={"candidates"}),
+                        "figures": figures.model_dump(mode="json", exclude={"cache_key_inputs"}),
+                        "equations": equations.model_dump(
+                            mode="json", exclude={"cache_key_inputs"}
+                        ),
+                        "mathml": math_page(dirs["page"], keys["mathml"], number).model_dump(
+                            mode="json", exclude={"cache_key_inputs"}
+                        ),
+                        "tables": tables.model_dump(mode="json", exclude={"cache_key_inputs"}),
+                        "table_view": view,
+                        "continuity": continuity.page_breaks(number),
+                    }
+                    ocr_input = getattr(extractor, "inputs", None)
+                    if ocr_input is not None and (ocr := ocr_input.read(number)) is not None:
+                        payload["ocr"] = ocr.model_dump(mode="json", exclude={"page"})
+                        payload["ocr"]["comparison_only"] = number in ocr_input.comparison_keys
+                        if number in ocr_input.comparison_keys:
+                            # Comparison text is separate; it never duplicates semantic tokens.
+                            payload["ocr_comparison_source"] = ocr.page.model_dump(mode="json")
+                    yield payload
+
+            stats["output"] = str(
+                _publish_final(
+                    snapshot,
+                    final_pages(),
+                    {
+                        "format_version": 1,
+                        "source_sha256": snapshot.digest,
+                        "furniture": furniture.book.model_dump(mode="json"),
+                        "structure": structure.model_dump(mode="json"),
+                        "lists": lists.model_dump(mode="json", exclude={"page_keys"}),
+                        "figures": _final_book_figures(
+                            figure_book, dirs["page"], keys["equations"], keys["tables"]
+                        ).model_dump(mode="json"),
+                        "equations": equation_book.model_dump(mode="json"),
+                        "mathml": math_book.model_dump(mode="json"),
+                        "tables": table_book.model_dump(mode="json"),
+                        "continuity": continuity.model_dump(mode="json"),
+                    },
+                    keys,
+                    output_dir,
+                    total,
+                    _final_images(
+                        figure_book,
+                        equation_book,
+                        math_book,
+                        table_book,
+                        dirs["page"],
+                        keys,
+                        ocr_input=getattr(extractor, "inputs", None),
+                    ),
+                )
+            )
+        if publishing is not None:
+            from book_core.assembly.cache import publish_book, read_native_evidence
+
+            profile, run_date, settings_sha256 = publishing
+            with stage(stages, "assembly"):
+                archive = Path(stats["output"])
+                folder, assembled = publish_book(
+                    archive,
+                    output_dir,
+                    source=source,
+                    extractor=extractor,
+                    native_page=lambda n: read_native_evidence(dirs["page"], keys["native"], n),
+                    cache_root=dirs["page"],
+                    native_key=keys["native"],
+                    source_sha256=snapshot.digest,
+                    final_key=archive.name,
+                    profile=profile,
+                    settings_sha256=settings_sha256,
+                    run_date=run_date,
+                    progress=progress,
+                )
+            keys["assembly_evidence"] = assembled["evidence_key"]
+            stats["book_json"] = str(folder)
+            stats["assembly"] = assembled
+        _register_outputs(root, snapshot.digest, dirs, keys, stages, total, persistent=persistent)
+        stats["cache_keys"] = keys
+
+
+def _final_book_figures(book, root, equations_key, tables_key):
+    """The book's figure record without the names of figures converted to equations or
+    absorbed as table pieces."""
+    converted = set()
+    for number in range(1, book.pages + 1):
+        converted |= {
+            c.figure_id for c in equation_page(root, equations_key, number).figure_conversions
+        }
+        for table in table_page(root, tables_key, number).tables:
+            converted |= set(table.absorbed_figure_ids)
+    if not converted:
+        return book
+    return book.model_copy(
+        update={"names": {k: v for k, v in book.names.items() if v not in converted}}
+    )
+
+
+def _link_fields(unit_id, links):
+    """The cross-page (and column) links of a unit in the continuity record: they replace
+    the lists-stage links in the final archive."""
+    came, to = links.get(unit_id, (None, None))
+    return {"continues_from": came, "continues_to": to}
+
+
+def _linked(units, links):
+    return [u.model_copy(update=_link_fields(u.id, links)) for u in units]
+
+
+def _table_view(units, tables):
+    """The final unit view of one page: units that lost lines to tables are ``removed`` and
+    their remaining parts ``added`` (a part may keep its unit's id)."""
+    final, gone, _ = unit_view(units, tables)
+    owned = {lid for table in tables for lid in table.line_ids}
+    changed = {u.id for u in units if owned & set(u.line_ids)}
+    source = {u.id for u in units}
+    return {
+        "removed": sorted(changed | set(gone)),
+        "added": [
+            u.model_dump(mode="json") for u in final if u.id in changed or u.id not in source
+        ],
+    }
+
+
+def _final_images(figure_book, equation_book, math_book, table_book, root, keys, *, ocr_input=None):
+    """{file name: cached path} of the archive images: exported figures (without those
+    converted to equations or absorbed as table pieces) and equation image fallbacks;
+    names never collide."""
+    pieces = set()
+    for number in range(1, figure_book.pages + 1):
+        for table in table_page(root, keys["tables"], number).tables:
+            pieces |= set(table.absorbed_figure_ids)
+    not_exported = set(equation_book.images_not_exported) | {
+        record.image.file_name
+        for number in range(1, figure_book.pages + 1)
+        for record in figure_page(root, keys["figures"], number).figures
+        if record.id in pieces and record.image is not None
+    }
+    images = {
+        name: image_path(root, keys["figures"], name)
+        for name in _image_files(figure_book, root, keys["figures"])
+        if name not in not_exported
+    }
+    taken = {name.casefold() for name in images}
+    for name in math_book.images:
+        if name.casefold() in taken:
+            raise ValueError("An equation image name collides with a figure image name")
+        images[name] = math_image_path(root, keys["mathml"], name)
+    if ocr_input is not None:
+        for number in sorted(set(ocr_input.page_keys) | set(ocr_input.comparison_keys)):
+            record = ocr_input.read(number)
+            if record.raster_asset:
+                if record.raster_asset.casefold() in taken:
+                    raise ValueError("An OCR scan image name collides with another archive asset")
+                images[record.raster_asset] = ocr_input.raster_path(number)
+                taken.add(record.raster_asset.casefold())
+    return images
+
+
+def _image_files(book, root, key):
+    """Exported image files of the book, in name order (spreads share one file)."""
+    names = set()
+    for number in range(1, book.pages + 1):
+        for record in figure_page(root, key, number).figures:
+            if record.image is not None:
+                names.add(record.image.file_name)
+    return sorted(names)
+
+
+class _NativePages:
+    """The cached native object page of one page number."""
+
+    def __init__(self, root, key):
+        self.root, self.key = Path(root), key
+
+    def __call__(self, number):
+        return verified_read(
+            self.root / "native" / self.key / f"{number}.json", NativeObjectPage, self.key
+        )
+
+
+class _AnalysisObjects:
+    """Native objects and compounds of one page from the cached object analysis."""
+
+    def __init__(self, root, key):
+        self.root, self.key = Path(root), key
+
+    def __call__(self, number):
+        from book_core.objects.models import ObjectAnalysis
+
+        analysis = verified_read(
+            self.root / "analysis" / self.key / f"{number}.json", ObjectAnalysis, self.key
+        )
+        return list(analysis.native.objects) + list(analysis.compounds)
+
+
+class _NativeObjects:
+    """(id, kind, bbox) of named native objects from the cached object analysis (one page)."""
+
+    def __init__(self, root, key):
+        self.root, self.key, self.page, self.objects = Path(root), key, None, {}
+
+    def __call__(self, number, ids):
+        from book_core.objects.models import ObjectAnalysis
+
+        if number != self.page:
+            analysis = verified_read(
+                self.root / "analysis" / self.key / f"{number}.json", ObjectAnalysis, self.key
+            )
+            self.objects = {o.id: (o.id, o.kind, o.bbox) for o in analysis.all_objects()}
+            self.page = number
+            del analysis
+        return [self.objects[i] for i in ids if i in self.objects]
+
+
+def _publish_final(snapshot, page_payloads, book_payload, keys, output_dir, total, images=None):
+    """Atomically publish an independently resolvable final archive."""
+    final_key = stable_id(
+        "final-book-4",
+        LOADED_FINAL_DIGEST,
+        snapshot.digest,
+        keys["lists"],
+        keys["characters"],
+        keys["figures"],
+        keys["equations"],
+        keys["mathml"],
+        keys["tables"],
+        keys["continuity"],
+        *([keys["ocr"]] if "ocr" in keys else []),
+    )
+    destination = output_dir / final_key
+    with tempfile.TemporaryDirectory(prefix=".final-", dir=output_dir) as temporary:
+        pending = Path(temporary) / "book"
+        pending.mkdir()
+        seen = set()
+        for payload in page_payloads:
+            page = payload["source"]
+            number = page["geometry"]["page"]
+            if (
+                page["source_sha256"] != snapshot.digest
+                or number in seen
+                or not 1 <= number <= total
+            ):
+                raise ValueError("Final archive source/page identity mismatch")
+            seen.add(number)
+            write_json(pending / f"page_{number:06d}.json.gz", payload)
+        if len(seen) != total:
+            raise ValueError("Final archive has incomplete page coverage")
+        write_json(pending / "book.json.gz", sorted_key_inputs(book_payload))
+        if images:
+            (pending / "images").mkdir()
+            for name, path in sorted(images.items()):
+                shutil.copyfile(path, pending / "images" / name)
+        manifest = {
+            "format_version": 2,
+            "complete": True,
+            "source_sha256": snapshot.digest,
+            "pages": total,
+            "keys": keys,
+            "files": {
+                p.relative_to(pending).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(pending.rglob("*"))
+                if p.is_file()
+            },
+        }
+        write_json(pending / "manifest.json.gz", manifest)
+        snapshot.check()
+        if final_producer_digest() != LOADED_FINAL_DIGEST:
+            raise RuntimeError("Book runner producer changed; restart the worker")
+        if destination.exists():
+            prior = read_json(destination / "manifest.json.gz")
+            if prior != manifest or any(
+                hashlib.sha256((destination / name).read_bytes()).hexdigest() != checksum
+                for name, checksum in manifest["files"].items()
+            ):
+                raise ValueError("Existing final output differs or is corrupt")
+        else:
+            os.replace(pending, destination)
+    return destination
+
+
+def stage_producer(stage):
+    """Effective producer closure of a stage, excluding configurations: it identifies
+    supersession in the cache registry and whether a stage is already cached."""
+    from book_core.cache_identity import producer_digest
+    from book_core.caching import PACKAGE, code_digest, coverage_files
+
+    scope = "extraction" if stage in {"native", "text"} else stage
+    producing_files = [p for p in coverage_files(scope) if p != "caching.py"]
+    return stable_id(code_digest(scope), producer_digest(scope, producing_files, PACKAGE))
+
+
+def _register_outputs(root, book, dirs, keys, stages, total, *, persistent):
+    for stage, key in keys.items():
+        if stage == "ocr":
+            # Preparation registers each page under its own input/asset fingerprint.
+            continue
+        if stage in {
+            "native",
+            "analysis",
+            "paint",
+            "characters",
+            "figures",
+            "equations",
+            "mathml",
+            "tables",
+            "layout",
+            "reading_order",
+            "text",
+            "assembly_evidence",
+        }:
+            paths = list((dirs["page"] / stage / key).glob("*.json"))
+            if stage in {"figures", "mathml"}:
+                paths += list((dirs["page"] / stage / key / "images").glob("*"))
+        elif stage == "structure_evidence":
+            paths = [dirs["structure"] / "structure/evidence" / f"{key}.json.gz"]
+        elif stage == "continuity":
+            paths = [dirs["page"] / "continuity" / f"{key}.json"]
+        else:
+            stage_root = dirs[stage] / stage
+            paths = [stage_root / "book" / f"{key}.json"]
+            paths += list((stage_root / "page" / key).glob("*.json"))
+            paths += list((stage_root / "definitions" / key).glob("*.json"))
+        sizes = [p.stat().st_size for p in paths if p.exists()]
+        stages.setdefault(stage, {}).update(
+            cache_bytes=sum(sizes), cache_files=len(sizes), cache_bytes_per_page=sum(sizes) / total
+        )
+        if persistent:
+            register(root, book, stage, key, paths, producer=stage_producer(stage))

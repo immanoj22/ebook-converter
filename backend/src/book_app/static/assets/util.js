@@ -1,0 +1,128 @@
+// Small helpers shared by all screens. No libraries: the app loads nothing from outside.
+
+export function h(tag, attrs = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "dataset") Object.assign(el.dataset, v);
+    else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2), v);
+    else if (k === "value") el.value = v;
+    else if (k === "checked" || k === "disabled" || k === "selected" || k === "hidden") el[k] = !!v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  add(el, children);
+  return el;
+}
+function add(el, children) {
+  for (const c of children.flat(Infinity)) {
+    if (c === null || c === undefined || c === false) continue;
+    el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+}
+// Like el.append, but skips null/undefined/false children (for `cond && h(...)`).
+export function append(el, ...children) { add(el, children); return el; }
+export const clear = (el) => { el.replaceChildren(); return el; };
+
+export class ApiError extends Error {
+  constructor(status, body) {
+    super(body?.detail || `The request failed (${status}).`);
+    this.status = status; this.body = body || {}; this.code = body?.code;
+  }
+}
+// The person signed in on this computer: a name and a role, no password (office network).
+export function me() {
+  try { return { name: localStorage.getItem("reviewer") || "", role: localStorage.getItem("role") || "" }; }
+  catch { return { name: "", role: "" }; }
+}
+export function signIn(name, role) { localStorage.setItem("reviewer", name); localStorage.setItem("role", role); }
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+// A slow request answers 202 "preparing" at once and goes on in the background; a page that only
+// reads asks again until the answer is ready, and says so. Anything that changes the book is
+// not repeated by itself: it is told to try again in a moment.
+function preparingNote(text) {
+  let el = document.getElementById("preparing-note");
+  if (!text) { el?.remove(); return; }
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "preparing-note"; el.className = "banner info"; el.setAttribute("role", "status");
+    el.dataset.testid = "preparing-note"; el.style.margin = "0 16px 12px";
+    document.getElementById("app")?.before(el);
+  }
+  el.textContent = text;
+}
+export async function api(method, url, body, opts = {}) {
+  const who = me();
+  const init = { method, headers: who.name ? { "X-User": encodeURIComponent(who.name), "X-Role": who.role || "reviewer" } : {} };
+  if (body !== undefined && !opts.raw) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(body); }
+  if (opts.raw) { init.body = body; if (opts.type) init.headers["Content-Type"] = opts.type; }
+  const started = Date.now();
+  try {
+    for (;;) {
+      let res;
+      try { res = await fetch(url, init); }
+      catch { throw new ApiError(0, { detail: "The app is not answering. Is it still running?" }); }
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = { detail: text.slice(0, 200) }; }
+      if (res.status === 202 && data?.code === "preparing") {
+        if (method !== "GET" || opts.noWait || Date.now() - started > 30 * 60 * 1000) {
+          throw new ApiError(202, { ...data, detail: `The ${data.what || "book"} is still being prepared. Try again in a moment.` });
+        }
+        preparingNote(`Preparing the ${data.what || "book"} — this page continues by itself (${Math.round((Date.now() - started) / 1000)} s).`);
+        await wait(Math.max(1, data.retry_after || 2) * 1000);
+        continue;
+      }
+      if (!res.ok) throw new ApiError(res.status, data);
+      return data;
+    }
+  } finally { preparingNote(null); }
+}
+export const get = (u) => api("GET", u);
+export const post = (u, b = {}) => api("POST", u, b);
+export const put = (u, b = {}) => api("PUT", u, b);
+export const del = (u) => api("DELETE", u);
+
+export function upload(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    const who = me();
+    if (who.name) { xhr.setRequestHeader("X-User", encodeURIComponent(who.name)); xhr.setRequestHeader("X-Role", who.role || "reviewer"); }
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded, e.total);
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data); else reject(new ApiError(xhr.status, data));
+    };
+    xhr.onerror = () => reject(new ApiError(0, { detail: "The upload was interrupted. Is the app still running?" }));
+    xhr.send(file);
+  });
+}
+
+export function toast(text, ms = 3500) {
+  const box = document.getElementById("toast");
+  const t = h("div", { role: "status" }, text);
+  box.append(t);
+  setTimeout(() => t.remove(), ms);
+}
+export const bytes = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`;
+export function elapsed(fromIso, toIso) {
+  if (!fromIso) return "";
+  const s = Math.max(0, Math.round(((toIso ? new Date(toIso) : new Date()) - new Date(fromIso)) / 1000));
+  const m = Math.floor(s / 60);
+  return m ? `${m} min ${String(s % 60).padStart(2, "0")} s` : `${s} s`;
+}
+export const when = (iso) => iso ? new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "";
+// Display names of the export formats: full (Export page) and short (lists).
+export const FORMAT_NAMES = { docbook: "DocBook XML (ZIP)", epub: "ePub 3", html: "HTML5", dtbook: "NIMAS / DTBook", daisy3: "DAISY 3 (text-only)", jats: "JATS", bits: "BITS" };
+export const FORMAT_SHORT = { docbook: "DocBook", epub: "ePub", html: "HTML", dtbook: "NIMAS", daisy3: "DAISY 3", jats: "JATS", bits: "BITS" };
+
+export const STATE = {
+  uploaded: "Uploaded", queued: "Waiting to start", converting: "Converting", converted: "Converted",
+  failed: "Stopped with an error", cancelled: "Cancelled",
+};
+export const badge = (cls, text) => h("span", { class: `badge ${cls}` }, text ?? cls);
+export function errBox(e) { return h("div", { class: "banner error", role: "alert", dataset: { testid: "error" } }, e.message || String(e)); }
+export function spinner(text) { return h("span", {}, h("span", { class: "spinner" }), text); }
+export function confirmDialog(text) { return window.confirm(text); }
