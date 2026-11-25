@@ -6,6 +6,26 @@ I built it for a publishing workflow where books arrive as PDFs and have to come
 
 ![Pipeline](docs/pipeline.png)
 
+## Screenshots
+
+These come from a short two-page sample PDF I wrote for this (a small guide to tea), not from a real book.
+
+**Books list**
+
+![Books](docs/screenshots/01-books.png)
+
+**Book details, checked by a person before export**
+
+![Details](docs/screenshots/03-details.png)
+
+**Browse view: the page on the left, the structure the converter found on the right**
+
+![Browse](docs/screenshots/04-browse.png)
+
+**Export, with the check result shown above the download history**
+
+![Export](docs/screenshots/05-export.png)
+
 ## What it does
 
 - Reads text, fonts, drawings, images and page geometry straight from the PDF. Scanned pages go through OCR.
